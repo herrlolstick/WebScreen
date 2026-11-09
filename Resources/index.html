@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000000">
+<title>WebScreen</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; touch-action: none; }
+  canvas, video { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; object-fit: contain; display: block; background: #000; }
+  video { display: none; }
+  #overlay {
+    position: fixed; inset: 0; display: flex; flex-direction: column; gap: 14px;
+    align-items: center; justify-content: center; text-align: center; padding: 24px;
+    color: #9a9a9a; font: 15px -apple-system, system-ui, sans-serif; background: #000;
+  }
+  #overlay.hidden { display: none; }
+  #overlay h1 { margin: 0; color: #eee; font-size: 22px; font-weight: 600; }
+  #toolbar {
+    position: fixed; top: max(10px, env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right));
+    display: flex; gap: 8px; opacity: 0; transition: opacity .25s; pointer-events: none;
+  }
+  #toolbar.visible { opacity: 1; pointer-events: auto; }
+  button {
+    font: 13px -apple-system, system-ui, sans-serif; color: #fff; background: rgba(40,40,40,.85);
+    border: 1px solid rgba(255,255,255,.15); border-radius: 8px; padding: 7px 12px; cursor: pointer;
+  }
+  #stats {
+    position: fixed; left: 10px; bottom: 10px; display: none; padding: 5px 8px; border-radius: 6px;
+    font: 12px ui-monospace, Menlo, monospace; color: #7f7; background: rgba(0,0,0,.65); white-space: pre;
+  }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<video id="video" muted autoplay playsinline disablepictureinpicture></video>
+<div id="overlay"><h1>WebScreen</h1><div id="message">Connecting …</div></div>
+<div id="toolbar">
+  <button id="btnFullscreen">Fullscreen</button>
+  <button id="btnStats">Stats</button>
+</div>
+<div id="stats"></div>
+
+<script>
+"use strict";
+const WS_PORT = "__WS_PORT__";
+
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+const video = document.getElementById("video");
+const overlay = document.getElementById("overlay");
+const message = document.getElementById("message");
+const toolbar = document.getElementById("toolbar");
+const statsEl = document.getElementById("stats");
+
+let ws = null;
+let mode = null;            // "jpeg" | "h264" | "hevc"
+let reconnectTimer = null;
+const stats = { frames: 0, bytes: 0, skipped: 0, since: performance.now() };
+
+function showMessage(text) { message.textContent = text; overlay.classList.remove("hidden"); }
+function hideMessage() { overlay.classList.add("hidden"); }
+function send(text) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(text); }
+
+const isVideoMode = (m) => m === "h264" || m === "hevc";
+
+function setMode(newMode) {
+  mode = newMode;
+  canvas.style.display = mode === "jpeg" ? "block" : "none";
+  video.style.display = isVideoMode(mode) ? "block" : "none";
+  resetJpeg();
+  resetVideo();
+}
+
+// ───────────── JPEG (still images, optionally changed regions only) ─────────────
+// Packet: [1][full?][u16 w][u16 h][u16 n] + n × ([u16 x][u16 y][u16 w][u16 h][u32 len][jpeg])
+// Partial updates must be drawn without gaps and in order. A full frame
+// replaces everything before it – queued packets are then discarded.
+
+const supportsBitmap = typeof createImageBitmap === "function";
+function decodeJpeg(blob) {
+  if (supportsBitmap) return createImageBitmap(blob);
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = (e) => { URL.revokeObjectURL(url); reject(e); };
+    img.src = url;
+  });
+}
+
+let jpegQueue = [];
+let jpegBusy = false;
+let waitingForFull = true;
+
+function resetJpeg() { jpegQueue = []; waitingForFull = true; }
+
+function onJpegPacket(buffer) {
+  const full = new DataView(buffer).getUint8(1) === 1;
+  if (full) {
+    stats.skipped += jpegQueue.length;
+    jpegQueue = [];
+    waitingForFull = false;
+  } else if (waitingForFull) {
+    return;
+  } else if (jpegQueue.length > 8) {
+    // We are falling behind → start over
+    jpegQueue = [];
+    waitingForFull = true;
+    send("sync");
+    return;
+  }
+  jpegQueue.push(buffer);
+  if (!jpegBusy) processJpeg();
+}
+
+async function processJpeg() {
+  jpegBusy = true;
+  while (jpegQueue.length) {
+    const buffer = jpegQueue.shift();
+    const view = new DataView(buffer);
+    const full = view.getUint8(1) === 1;
+    const width = view.getUint16(2), height = view.getUint16(4), count = view.getUint16(6);
+    const patches = [];
+    let offset = 8;
+    for (let i = 0; i < count; i++) {
+      const x = view.getUint16(offset), y = view.getUint16(offset + 2);
+      const length = view.getUint32(offset + 8);
+      offset += 12;
+      patches.push({ x, y, blob: new Blob([new Uint8Array(buffer, offset, length)], { type: "image/jpeg" }) });
+      offset += length;
+    }
+    try {
+      const images = await Promise.all(patches.map((p) => decodeJpeg(p.blob)));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;   // clears the canvas – only harmless for full frames
+        canvas.height = height;
+        if (!full) { waitingForFull = true; send("sync"); }
+      }
+      images.forEach((image, i) => {
+        ctx.drawImage(image, patches[i].x, patches[i].y);
+        if (image.close) image.close();
+      });
+      stats.frames++;
+      hideMessage();
+    } catch (e) {
+      console.error("Could not decode image:", e);
+      jpegQueue = [];
+      waitingForFull = true;
+      send("sync");
+    }
+  }
+  jpegBusy = false;
+}
+
+// ───────────── H.264 / HEVC via Media Source Extensions ─────────────
+// Init:  [2][len][codec][ftyp+moov]     Frame: [3][key?][moof+mdat]
+
+const MediaSourceImpl = window.ManagedMediaSource || window.MediaSource;
+let mediaSource = null, sourceBuffer = null, codec = null;
+let initSegment = null, segmentQueue = [], waitingForKey = true;
+
+function resetVideo() {
+  if (mediaSource) {
+    try { if (mediaSource.readyState === "open") mediaSource.endOfStream(); } catch (_) {}
+  }
+  mediaSource = null; sourceBuffer = null; codec = null; initSegment = null;
+  segmentQueue = []; waitingForKey = true;
+  video.removeAttribute("src");
+  try { video.srcObject = null; } catch (_) {}
+}
+
+function onInitPacket(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const length = bytes[1];
+  const newCodec = new TextDecoder().decode(bytes.subarray(2, 2 + length));
+  initSegment = bytes.slice(2 + length);
+  segmentQueue = [];
+  waitingForKey = true;
+
+  if (!MediaSourceImpl || !MediaSourceImpl.isTypeSupported(`video/mp4; codecs="${newCodec}"`)) {
+    showMessage(mode === "hevc"
+      ? "This browser cannot play HEVC. Switch WebScreen to “Video auto” or “H.264”."
+      : "This browser cannot play the video stream. Switch WebScreen to “JPEG”.");
+    return;
+  }
+  if (newCodec !== codec || !sourceBuffer) {
+    codec = newCodec;
+    createMediaSource();
+  } else {
+    segmentQueue.push(initSegment);
+    pump();
+  }
+}
+
+function createMediaSource() {
+  mediaSource = new MediaSourceImpl();
+  sourceBuffer = null;
+  video.disableRemotePlayback = true;
+  if (window.ManagedMediaSource && mediaSource instanceof window.ManagedMediaSource) {
+    video.srcObject = mediaSource;
+  } else {
+    video.src = URL.createObjectURL(mediaSource);
+  }
+  const ms = mediaSource;
+  ms.addEventListener("sourceopen", () => {
+    if (ms !== mediaSource) return;
+    sourceBuffer = ms.addSourceBuffer(`video/mp4; codecs="${codec}"`);
+    sourceBuffer.mode = "sequence";   // simply close gaps left by skipped frames
+    sourceBuffer.addEventListener("updateend", pump);
+    segmentQueue.unshift(initSegment);
+    pump();
+  }, { once: true });
+}
+
+function onVideoPacket(buffer) {
+  const isKey = new DataView(buffer).getUint8(1) === 1;
+  if (waitingForKey && !isKey) return;
+  if (segmentQueue.length > 10) {
+    segmentQueue = segmentQueue.filter((s) => s === initSegment);
+    waitingForKey = true;
+    stats.skipped++;
+    send("sync");
+    if (!isKey) return;
+  }
+  waitingForKey = false;
+  segmentQueue.push(new Uint8Array(buffer, 2));
+  stats.frames++;
+  pump();
+}
+
+function pump() {
+  if (!sourceBuffer || sourceBuffer.updating || !segmentQueue.length) return;
+  try {
+    sourceBuffer.appendBuffer(segmentQueue.shift());
+  } catch (e) {
+    console.error("appendBuffer:", e);
+    trimBuffer(true);
+    waitingForKey = true;
+    send("sync");
+  }
+}
+
+function trimBuffer(force) {
+  if (!sourceBuffer || sourceBuffer.updating || !video.buffered.length) return;
+  const keep = force ? 1 : 6;
+  const start = video.buffered.start(0);
+  if (video.currentTime - start > keep + 2) {
+    try { sourceBuffer.remove(start, video.currentTime - keep); } catch (_) {}
+  }
+}
+
+// Keep latency low: always play close to the end of the buffer
+setInterval(() => {
+  if (!isVideoMode(mode) || !video.buffered.length) return;
+  const end = video.buffered.end(video.buffered.length - 1);
+  const lag = end - video.currentTime;
+  if (lag > 0.35) video.currentTime = end - 0.05;
+  else if (lag > 0.12) video.playbackRate = 1.15;
+  else video.playbackRate = 1.0;
+  if (video.paused) video.play().catch(() => {});
+  if (video.readyState >= 2) hideMessage();
+}, 200);
+setInterval(() => trimBuffer(false), 5000);
+
+// ───────────── Connection ─────────────
+
+// Explicitly requested screen: ?screen=N in the address (otherwise the Mac decides)
+function wantedScreen() {
+  const param = new URLSearchParams(location.search).get("screen");
+  const id = parseInt(param, 10);
+  return isNaN(id) ? null : id;
+}
+
+// Persistent identifier of this device so WebScreen recognizes it again
+function deviceKey() {
+  try {
+    let key = localStorage.getItem("webscreen.device");
+    if (!key) {
+      key = (crypto.randomUUID ? crypto.randomUUID()
+             : Date.now().toString(36) + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2));
+      localStorage.setItem("webscreen.device", key);
+    }
+    return key;
+  } catch (_) {
+    return "";
+  }
+}
+
+// Can this browser play HEVC via Media Source Extensions?
+function supportsHEVC() {
+  try {
+    return !!(MediaSourceImpl && MediaSourceImpl.isTypeSupported('video/mp4; codecs="hvc1.1.6.L120.90"'));
+  } catch (_) {
+    return false;
+  }
+}
+
+function connect() {
+  clearTimeout(reconnectTimer);
+  showMessage("Connecting to the Mac …");
+  const socket = new WebSocket(`ws://${location.hostname}:${WS_PORT}/`);
+  ws = socket;
+  socket.binaryType = "arraybuffer";
+  socket.onopen = () => {
+    if (socket !== ws) return;
+    showMessage("Connected – waiting for the image …");
+    send("join:" + JSON.stringify({
+      device: deviceKey(),
+      hevc: supportsHEVC(),
+      screen: wantedScreen(),
+      width: Math.round(screen.width),
+      height: Math.round(screen.height),
+      dpr: window.devicePixelRatio || 1,
+      ua: navigator.userAgent,
+    }));
+  };
+  socket.onmessage = (event) => {
+    if (socket !== ws) return;   // stragglers from an old connection
+    if (typeof event.data === "string") {
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (_) { return; }
+      if (msg.type === "hello") {
+        setMode(msg.mode);
+        document.title = msg.name || "WebScreen";
+        showMessage("Connected to “" + (msg.name || "WebScreen") + "” …");
+      } else if (msg.type === "waiting") {
+        resetJpeg();
+        resetVideo();
+        showMessage(msg.message || "Waiting for a screen …");
+      }
+      return;
+    }
+    const buffer = event.data;
+    stats.bytes += buffer.byteLength;
+    switch (new Uint8Array(buffer, 0, 1)[0]) {
+      case 1: onJpegPacket(buffer); break;
+      case 2: onInitPacket(buffer); break;
+      case 3: onVideoPacket(buffer); break;
+    }
+  };
+  socket.onclose = () => {
+    if (socket !== ws) return;
+    ws = null;
+    resetJpeg();
+    resetVideo();
+    showMessage("No connection to the Mac – retrying …");
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connect, 1500);
+  };
+  socket.onerror = () => socket.close();
+}
+
+// ───────────── Controls ─────────────
+
+let toolbarTimer = null;
+function showToolbar() {
+  toolbar.classList.add("visible");
+  clearTimeout(toolbarTimer);
+  toolbarTimer = setTimeout(() => toolbar.classList.remove("visible"), 3000);
+}
+document.addEventListener("pointerdown", showToolbar);
+
+document.getElementById("btnFullscreen").addEventListener("click", () => {
+  const el = document.documentElement;
+  if (document.fullscreenElement || document.webkitFullscreenElement) {
+    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+  } else {
+    const request = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (request) request.call(el);
+  }
+});
+
+document.getElementById("btnStats").addEventListener("click", () => {
+  statsEl.style.display = statsEl.style.display === "block" ? "none" : "block";
+});
+
+setInterval(() => {
+  const now = performance.now();
+  const secs = (now - stats.since) / 1000;
+  let extra = "";
+  if (isVideoMode(mode) && video.buffered.length) {
+    const lag = video.buffered.end(video.buffered.length - 1) - video.currentTime;
+    extra = `  Buffer: ${(lag * 1000).toFixed(0)} ms`;
+  }
+  statsEl.textContent =
+    `${{ jpeg: "JPEG", h264: "H.264", hevc: "HEVC" }[mode] || "–"}  ${(stats.frames / secs).toFixed(0)} fps  ${((stats.bytes * 8) / secs / 1e6).toFixed(1)} Mbit/s\n` +
+    `skipped: ${stats.skipped}${extra}`;
+  stats.frames = 0; stats.bytes = 0; stats.skipped = 0; stats.since = now;
+}, 1000);
+
+connect();
+</script>
+</body>
+</html>
