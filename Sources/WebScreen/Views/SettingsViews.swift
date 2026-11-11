@@ -24,7 +24,7 @@ struct AssignmentSettingsView: View {
                         ForEach(model.fixedScreens) { Text($0.config.name).tag($0.id) }
                     }
                 case .perDevice:
-                    Text("Every device gets its own screen. WebScreen recognizes devices again – they always land on “their” screen, and macOS remembers its position.")
+                    Text("Every device gets its own screen. WebScreen recognizes devices again – they always land on “their” screen, and macOS remembers its position. Regular screens are hidden and stay off in this mode.")
                         .foregroundStyle(.secondary)
                     Toggle(isOn: $model.autoMatchDevice) {
                         Text("Match the device’s resolution")
@@ -36,6 +36,7 @@ struct AssignmentSettingsView: View {
             }
 
             Section {
+                if model.assignmentMode == .shared {
                 LabeledContent {
                     EmptyView()
                 } label: {
@@ -47,6 +48,7 @@ struct AssignmentSettingsView: View {
                 } label: {
                     Text("Open a screen directly")
                     Text("Every screen has its own code. Use it to open that screen on a device – just for this connection, without changing anything.")
+                }
                 }
                 LabeledContent {
                     EmptyView()
@@ -88,7 +90,9 @@ struct AssignmentSettingsView: View {
             } footer: {
                 let size = model.defaultSize
                 let scale = model.defaultHiDPI ? 2 : 1
-                Text("\(size.width) × \(size.height) points (\(size.width * scale) × \(size.height * scale) pixels). Used for “Add Screen” and for device screens when the device resolution is not matched.")
+                Text(model.assignmentMode == .shared
+                     ? "\(size.width) × \(size.height) points (\(size.width * scale) × \(size.height * scale) pixels). Used for “Add Screen” and for device screens when the device resolution is not matched."
+                     : "\(size.width) × \(size.height) points (\(size.width * scale) × \(size.height * scale) pixels). Used for device screens when the device resolution is not matched.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -120,6 +124,13 @@ struct StreamSettingsView: View {
                     Text("60 Hz").tag(60)
                 }
                 .pickerStyle(.segmented)
+
+                if model.mode != .jpeg {
+                    Toggle(isOn: $model.steadyFrameRate) {
+                        Text("Keep the frame rate steady")
+                        Text("Movement starts smoothly – for example when you drag a window onto a screen. Turn off to send frames only when something changes (uses a little less power).")
+                    }
+                }
             } header: {
                 Text("Method")
             }
@@ -152,7 +163,7 @@ struct StreamSettingsView: View {
             } else {
                 Section("Video") {
                     Picker(selection: $model.bitrateMbps) {
-                        ForEach([2, 4, 6, 8, 12, 20, 30], id: \.self) { Text("\($0) Mbit/s").tag($0) }
+                        ForEach([2, 4, 6, 8, 12, 20, 30, 50], id: \.self) { Text("\($0) Mbit/s").tag($0) }
                     } label: {
                         Text(model.adaptive ? "Maximum bitrate" : "Bitrate")
                         Text("Applies to Full HD – larger screens (Retina, 4K) automatically get proportionally more, up to four times as much.")
@@ -178,10 +189,34 @@ struct StreamSettingsView: View {
                         .multilineTextAlignment(.trailing)
                         .frame(width: 90)
                 }
+                if model.needsRestart {
+                    LabeledContent {
+                        Button("Restart Streaming") { model.restartAll() }
+                    } label: {
+                        Label("Takes effect after a restart", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                }
             } header: {
                 Text("Network")
             } footer: {
-                Text("The receiver page runs on port \(String(model.port)), the image data on port \(String(model.port + 1)).")
+                Text(model.lowLatency
+                     ? "The receiver page runs on port \(String(model.port)), the image data on port \(String(model.port + 1)). Low-latency mode also uses ports \(String(model.port + 2)) (HTTPS) and \(String(model.port + 3))."
+                     : "The receiver page runs on port \(String(model.port)), the image data on port \(String(model.port + 1)).")
+                    .foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle(isOn: $model.lowLatency) {
+                    Text("HTTPS with WebCodecs")
+                    Text("For H.264/HEVC: browsers decode every frame immediately instead of buffering it. Needs HTTPS, which WebScreen sets up via local-ip.sh. Devices keep using the same address and switch over automatically; if HTTPS isn’t reachable, they stay on the normal mode. Not needed for “Real-time”, which is already this fast.")
+                }
+                if model.isRunning {
+                    secureStatusRow
+                }
+            } header: {
+                Text("Expert")
+            } footer: {
+                Text("On a FRITZ!Box, add “local-ip.sh” under Home Network → Network → Network Settings → DNS Rebind Protection, otherwise devices can’t resolve the HTTPS address. The certificate’s private key is public by design, so this mode gives browsers a secure context, not extra privacy.")
                     .foregroundStyle(.secondary)
             }
         }
@@ -189,12 +224,43 @@ struct StreamSettingsView: View {
         .navigationTitle("Streaming")
     }
 
+    @ViewBuilder
+    private var secureStatusRow: some View {
+        switch model.secureStatus {
+        case .active(let expires):
+            LabeledContent {
+                Text(model.secureURL ?? "")
+                    .font(.callout.monospaced())
+                    .textSelection(.enabled)
+            } label: {
+                Label("HTTPS active", systemImage: "lock.fill")
+                    .foregroundStyle(.green)
+                Text("Certificate valid until \(expires.formatted(date: .abbreviated, time: .omitted))")
+            }
+        case .failed(let message):
+            LabeledContent {
+                EmptyView()
+            } label: {
+                Label("HTTPS unavailable", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(message)
+            }
+        case nil:
+            if model.lowLatency {
+                Text("Restart streaming to turn on the low-latency mode.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private var modeDescription: String {
         switch model.mode {
+        case .realtime:
+            return "Real-time video via WebRTC – robust on weak Wi-Fi (no stalls after lost packets), but browsers add a playout buffer: noticeably more latency than H.264/HEVC on a good network."
         case .jpeg:
             return "Still images: lowest latency and works in every browser – but needs more bandwidth when a lot is moving."
         case .h264:
-            return "H.264 video: low bandwidth and works in practically every browser. About 0.1–0.2 s latency, at most 4096 pixels wide."
+            return "H.264 video: low bandwidth, very low latency and works in practically every browser. At most 4096 pixels wide."
         case .hevc:
             return "HEVC video: another 30–50 % less bandwidth than H.264 and up to 8K. Works on all Apple devices, on Windows/Android only with a hardware decoder."
         case .videoAuto:
@@ -308,7 +374,8 @@ private struct KnownDeviceRow: View {
             Picker("Screen", selection: pinBinding) {
                 Text("Automatic (\(model.automaticTargetName(for: device)))").tag(Int?.none)
                 Divider()
-                ForEach(model.fixedScreens) { screen in
+                // Only screens the current mode uses – “one per device” has no regular screens
+                ForEach(model.visibleScreens.filter { $0.id != device.ownScreenID }) { screen in
                     Text(screen.config.name).tag(Int?.some(screen.id))
                 }
                 if let own = model.screen(device.ownScreenID) {
@@ -336,7 +403,11 @@ private struct KnownDeviceRow: View {
 
     private var pinBinding: Binding<Int?> {
         Binding(
-            get: { device.pinnedScreenID },
+            get: {
+                // A pin to a screen the mode doesn't use is ignored – show it as automatic
+                guard let screen = model.screen(device.pinnedScreenID), model.isUsable(screen) else { return nil }
+                return screen.id
+            },
             set: { model.pin(device, to: $0) }
         )
     }
@@ -389,5 +460,30 @@ struct GeneralSettingsView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             hasPermission = CGPreflightScreenCaptureAccess()
         }
+    }
+}
+
+// MARK: - Settings window (⌘,)
+
+struct SettingsView: View {
+    private enum Tab: Hashable { case general, assignment, streaming, devices }
+    @State private var tab: Tab = .assignment
+
+    var body: some View {
+        TabView(selection: $tab) {
+            GeneralSettingsView()
+                .tabItem { Label("General", systemImage: "gearshape") }
+                .tag(Tab.general)
+            AssignmentSettingsView()
+                .tabItem { Label("Assignment", systemImage: "arrow.triangle.branch") }
+                .tag(Tab.assignment)
+            StreamSettingsView()
+                .tabItem { Label("Streaming", systemImage: "antenna.radiowaves.left.and.right") }
+                .tag(Tab.streaming)
+            DevicesView()
+                .tabItem { Label("Devices", systemImage: "ipad.and.iphone") }
+                .tag(Tab.devices)
+        }
+        .frame(width: 680, height: 600)
     }
 }

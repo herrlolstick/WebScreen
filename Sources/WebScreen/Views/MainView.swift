@@ -4,29 +4,6 @@ import SwiftUI
 enum Page: Hashable {
     case overview
     case screen(Int)
-    case assignment, stream, devices, general
-
-    var title: String {
-        switch self {
-        case .overview: return "Overview"
-        case .screen: return "Screen"
-        case .assignment: return "Assignment"
-        case .stream: return "Streaming"
-        case .devices: return "Devices"
-        case .general: return "General"
-        }
-    }
-
-    var symbol: String {
-        switch self {
-        case .overview: return "rectangle.on.rectangle.angled"
-        case .screen: return "display"
-        case .assignment: return "arrow.triangle.branch"
-        case .stream: return "antenna.radiowaves.left.and.right"
-        case .devices: return "ipad.and.iphone"
-        case .general: return "gearshape"
-        }
-    }
 }
 
 struct MainView: View {
@@ -37,35 +14,53 @@ struct MainView: View {
         NavigationSplitView {
             List(selection: $page) {
                 Section {
-                    row(.overview)
+                    Label("Overview", systemImage: "rectangle.on.rectangle.angled")
+                        .tag(Page.overview)
                 }
-                Section("Screens") {
-                    ForEach(model.fixedScreens) { screen in
-                        ScreenSidebarRow(screen: screen)
-                            .tag(Page.screen(screen.id))
-                    }
-                    Button {
-                        let screen = model.addScreen()
-                        page = .screen(screen.id)
-                    } label: {
-                        Label("Add Screen", systemImage: "plus")
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.tint)
-                }
-                if !model.deviceScreens.isEmpty {
-                    Section("Device Screens") {
-                        ForEach(model.deviceScreens) { screen in
+                switch model.assignmentMode {
+                case .shared:
+                    Section("Screens") {
+                        ForEach(model.fixedScreens) { screen in
                             ScreenSidebarRow(screen: screen)
                                 .tag(Page.screen(screen.id))
                         }
+                        Button {
+                            let screen = model.addScreen()
+                            page = .screen(screen.id)
+                        } label: {
+                            Label("Add Screen", systemImage: "plus")
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(.tint)
                     }
-                }
-                Section("Settings") {
-                    row(.assignment)
-                    row(.stream)
-                    row(.devices)
-                    row(.general)
+                    // Only reachable via a fixed assignment or a screen code
+                    if !model.deviceScreens.isEmpty {
+                        Section("Device Screens") {
+                            ForEach(model.deviceScreens) { screen in
+                                ScreenSidebarRow(screen: screen)
+                                    .tag(Page.screen(screen.id))
+                            }
+                        }
+                    }
+                case .perDevice:
+                    // One section per computer/tablet – its browsers' screens below it
+                    ForEach(model.deviceGroups) { group in
+                        Section {
+                            ForEach(group.screens) { screen in
+                                ScreenSidebarRow(screen: screen, title: model.browserName(of: screen))
+                                    .tag(Page.screen(screen.id))
+                            }
+                        } header: {
+                            Label(group.title, systemImage: group.symbol)
+                        }
+                    }
+                    if model.deviceScreens.isEmpty {
+                        Section("Devices") {
+                            Text("Appears as soon as a device connects")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
             }
             .navigationSplitViewColumnWidth(min: 210, ideal: 230, max: 280)
@@ -82,15 +77,10 @@ struct MainView: View {
                 }
         }
         .frame(minWidth: 860, minHeight: 600)
-        .onChange(of: model.screens.map(\.id)) { _, ids in
+        .onChange(of: model.visibleScreens.map(\.id)) { _, ids in
             if case .screen(let id) = page, !ids.contains(id) { page = .overview }
         }
-    }
-
-    private func row(_ page: Page) -> some View {
-        Label(page.title, systemImage: page.symbol)
-            .badge(page == .devices ? model.clients.count : 0)
-            .tag(page)
+        .background(SettingsOpenerBridge())
     }
 
     @ViewBuilder
@@ -99,20 +89,12 @@ struct MainView: View {
         case .overview:
             OverviewView(page: $page)
         case .screen(let id):
-            if let screen = model.screen(id) {
+            if let screen = model.screen(id), model.isUsable(screen) {
                 ScreenDetailView(screen: screen)
                     .id(screen.id)
             } else {
                 OverviewView(page: $page)
             }
-        case .assignment:
-            AssignmentSettingsView()
-        case .stream:
-            StreamSettingsView()
-        case .devices:
-            DevicesView()
-        case .general:
-            GeneralSettingsView()
         }
     }
 
@@ -124,6 +106,11 @@ struct MainView: View {
             Spacer(minLength: 4)
             Label("\(model.runningScreenCount)", systemImage: "display")
             Label("\(model.clients.count)", systemImage: "ipad.and.iphone")
+            SettingsLink {
+                Image(systemName: "gearshape")
+            }
+            .buttonStyle(.borderless)
+            .help("Settings (⌘,)")
         }
         .labelStyle(CompactLabelStyle())
         .font(.callout)
@@ -141,7 +128,7 @@ struct MainView: View {
                 HStack(spacing: 12) {
                     Image(systemName: "arrow.triangle.2.circlepath")
                         .foregroundStyle(.tint)
-                    Text("New port – restart streaming")
+                    Text("Network settings changed – restart streaming")
                         .font(.callout)
                         .lineLimit(1)
                     Button("Apply") { model.restartAll() }
@@ -162,11 +149,12 @@ struct MainView: View {
 private struct ScreenSidebarRow: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject var screen: ScreenSession
+    var title: String? = nil
 
     var body: some View {
         Label {
             HStack(spacing: 6) {
-                Text(screen.config.name).lineLimit(1)
+                Text(title ?? screen.config.name).lineLimit(1)
                 if screen.id == model.primaryScreen?.id && model.assignmentMode == .shared {
                     Image(systemName: "star.fill")
                         .font(.caption2)
@@ -341,5 +329,26 @@ struct ErrorBanner: View {
         }
         .padding(14)
         .liquidGlass(in: RoundedRectangle(cornerRadius: 16, style: .continuous), tint: .orange.opacity(0.25))
+    }
+}
+
+// MARK: - Opening the settings window from AppKit (Dock menu)
+
+enum SettingsOpener {
+    @MainActor static var open: (() -> Void)?
+}
+
+/// Hands SwiftUI's `openSettings` action to AppKit code such as the Dock menu
+private struct SettingsOpenerBridge: View {
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        Color.clear
+            .onAppear {
+                SettingsOpener.open = {
+                    NSApp.activate(ignoringOtherApps: true)
+                    openSettings()
+                }
+            }
     }
 }

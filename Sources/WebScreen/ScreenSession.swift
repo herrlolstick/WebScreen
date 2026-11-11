@@ -16,6 +16,9 @@ struct ScreenConfig: Codable, Equatable, Identifiable {
     var ownerDeviceID: String?
     /// Keep active even without a connected device
     var keepAlive: Bool = false
+    /// Device screens are lined up to the right of the existing displays once;
+    /// after that macOS remembers wherever the user moves them.
+    var placed: Bool = false
 
     var pixelWidth: Int { width * (hiDPI ? 2 : 1) }
     var pixelHeight: Int { height * (hiDPI ? 2 : 1) }
@@ -47,6 +50,7 @@ struct ScreenConfig: Codable, Equatable, Identifiable {
         hiDPI = try c.decodeIfPresent(Bool.self, forKey: .hiDPI) ?? false
         ownerDeviceID = try c.decodeIfPresent(String.self, forKey: .ownerDeviceID)
         keepAlive = try c.decodeIfPresent(Bool.self, forKey: .keepAlive) ?? false
+        placed = try c.decodeIfPresent(Bool.self, forKey: .placed) ?? false
     }
 }
 
@@ -59,6 +63,8 @@ struct GlobalSettings: Equatable {
     var bitrateMbps: Int
     var adaptive: Bool
     var showsCursor: Bool
+    /// Real-time: repeat the last frame so the stream never goes idle
+    var steadyFrameRate: Bool
 }
 
 /// A virtual screen including capture and encoding.
@@ -89,6 +95,8 @@ final class ScreenSession: ObservableObject, Identifiable {
     /// The capture stopped unexpectedly (e.g. because macOS reconfigured the display).
     /// Devices stay assigned – the app can restart it.
     var onUnexpectedStop: (() -> Void)?
+    /// The screen changed its own configuration (e.g. it was placed) – save it
+    var onConfigChanged: (() -> Void)?
 
     /// Virtual screens always run at 60 Hz – the capture controls the streaming
     /// frame rate. That way it can change without recreating the screen.
@@ -122,6 +130,11 @@ final class ScreenSession: ObservableObject, Identifiable {
                 refreshRate: Self.displayRefreshRate, serial: UInt32(config.id), name: config.name
             )
             displayInfo = info
+            if config.isDeviceScreen && !config.placed {
+                VirtualDisplayManager.placeRightOfOtherDisplays(info.displayID)
+                self.config.placed = true
+                onConfigChanged?()
+            }
             self.server = server
             activeGlobal = global
 
@@ -199,8 +212,13 @@ final class ScreenSession: ObservableObject, Identifiable {
         let pipelineChanged = target != codec
             || global.fps != old.fps || global.quality != old.quality
             || global.deltaUpdates != old.deltaUpdates || global.bitrateMbps != old.bitrateMbps
-            || global.adaptive != old.adaptive
-        if pipelineChanged {
+            || global.adaptive != old.adaptive || global.steadyFrameRate != old.steadyFrameRate
+        if pipelineChanged, target == .webrtc, codec == .webrtc, let rtc = pipeline as? WebRTCPipeline {
+            // Keep the peer connections – WebRTC adapts bitrate and frame rate live
+            rtc.update(fps: global.fps,
+                       bitrate: Int(Self.effectiveBitrateMbps(global.bitrateMbps, info: info) * 1_000_000),
+                       steady: global.steadyFrameRate)
+        } else if pipelineChanged {
             let announce = target != codec
             pipeline?.stop()
             do {
@@ -224,7 +242,7 @@ final class ScreenSession: ObservableObject, Identifiable {
     private func fittingCodec(_ codec: StreamCodec, for config: ScreenConfig) -> StreamCodec {
         let size = max(config.pixelWidth, config.pixelHeight)
         if size <= codec.maxDimension { return codec }
-        if codec == .h264 && size <= StreamCodec.hevc.maxDimension { return .hevc }
+        if (codec == .h264 || codec == .webrtc) && size <= StreamCodec.hevc.maxDimension { return .hevc }
         return .jpeg
     }
 
@@ -247,12 +265,18 @@ final class ScreenSession: ObservableObject, Identifiable {
             let video = try VideoPipeline(codec: codec, width: info.pixelWidth, height: info.pixelHeight,
                                           fps: global.fps,
                                           bitrate: Int(Self.effectiveBitrateMbps(global.bitrateMbps, info: info) * 1_000_000),
-                                          adaptive: controller)
-            video.onInit = { [weak server] in server?.setInit($0, screen: screenID) }
+                                          adaptive: controller, steady: global.steadyFrameRate)
+            video.onInit = { [weak server] in server?.setInit($0, raw: $1, screen: screenID) }
             pipeline = video
+        case .webrtc:
+            let rtc = WebRTCPipeline(width: info.pixelWidth, height: info.pixelHeight, fps: global.fps,
+                                     bitrate: Int(Self.effectiveBitrateMbps(global.bitrateMbps, info: info) * 1_000_000),
+                                     steady: global.steadyFrameRate)
+            rtc.sendSignal = { [weak server] client, json in server?.sendSignal(json, to: client) }
+            pipeline = rtc
         }
-        pipeline.onPacket = { [weak server] packet, isSync in
-            server?.broadcast(packet, isSync: isSync, screen: screenID)
+        pipeline.onPacket = { [weak server] packet, raw, isSync in
+            server?.broadcast(packet, raw: raw, isSync: isSync, screen: screenID)
         }
         pipeline.hasReceivers = { [weak server] in server?.hasReceivers(screen: screenID) ?? false }
         self.pipeline = pipeline
@@ -260,12 +284,18 @@ final class ScreenSession: ObservableObject, Identifiable {
 
         // With a new method, (re-)registering greets connected devices again;
         // otherwise only the callbacks are switched to the new pipeline.
-        server.registerScreen(id, channel: .init(
+        var channel = StreamServer.ScreenChannel(
             name: (activeConfig ?? config).name,
             codec: codec,
             onSyncNeeded: { [weak pipeline] in pipeline?.requestSync() },
             onCongestion: { [weak controller] in controller?.report(congested: $0) }
-        ), announce: announce)
+        )
+        if let rtc = pipeline as? WebRTCPipeline {
+            channel.onClientAttached = { [weak rtc] in rtc?.attach($0) }
+            channel.onClientDetached = { [weak rtc] in rtc?.detach($0) }
+            channel.onSignal = { [weak rtc] in rtc?.handleSignal($0, json: $1) }
+        }
+        server.registerScreen(id, channel: channel, announce: announce)
     }
 
     private func connectCapture() {
@@ -321,6 +351,9 @@ final class ScreenSession: ObservableObject, Identifiable {
         case .jpeg:
             let q = 45 + Double(global.quality - 45) * level
             return "JPEG · \(Int(q.rounded())) %"
+        case .webrtc:
+            let base = displayInfo.map { Self.effectiveBitrateMbps(global.bitrateMbps, info: $0) } ?? Double(global.bitrateMbps)
+            return "Real-time · up to " + String(format: "%.0f Mbit/s", base)
         case .h264, .hevc:
             let base = displayInfo.map { Self.effectiveBitrateMbps(global.bitrateMbps, info: $0) } ?? Double(global.bitrateMbps)
             let mbps = max(1, base * level)

@@ -1,0 +1,5 @@
+module CGVirtualDisplayBridge {
+    header "CGVirtualDisplay.h"
+    header "WSVideoEncoderBase.h"
+    export *
+}

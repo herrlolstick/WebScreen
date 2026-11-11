@@ -30,6 +30,16 @@ struct KnownDevice: Codable, Identifiable, Equatable {
     /// Own screen (mode “own screen per device”)
     var ownScreenID: Int?
     var lastSeen: Date
+    /// Last network address – used to show screens of several browsers on one computer together
+    var lastAddress: String?
+}
+
+/// Screens grouped by the computer/tablet they are shown on
+struct DeviceGroup: Identifiable {
+    let id: String
+    let title: String
+    let symbol: String
+    let screens: [ScreenSession]
 }
 
 @MainActor
@@ -53,7 +63,14 @@ final class AppModel: ObservableObject {
 
     // MARK: Assignment
     @Published var assignmentMode: AssignmentMode {
-        didSet { save(assignmentMode.rawValue, "assignmentMode"); reassignAllLater() }
+        didSet {
+            save(assignmentMode.rawValue, "assignmentMode")
+            guard isRunning else { return }
+            Task {
+                await reassignAll()
+                await deactivateUnusedScreens()
+            }
+        }
     }
     @Published var primaryScreenID: Int {
         didSet { save(primaryScreenID, "primaryScreen"); reassignAllLater() }
@@ -70,8 +87,20 @@ final class AppModel: ObservableObject {
     @Published var bitrateMbps: Int { didSet { save(bitrateMbps, "bitrateMbps"); applyLiveSettingsLater() } }
     @Published var adaptive: Bool { didSet { save(adaptive, "adaptive"); applyLiveSettingsLater() } }
     @Published var showsCursor: Bool { didSet { save(showsCursor, "showsCursor"); applyLiveSettingsLater() } }
-    /// Only a new port requires restarting the stream
+    /// Real-time: keep the frame rate constant so movement starts without a hitch
+    @Published var steadyFrameRate: Bool { didSet { save(steadyFrameRate, "steadyFrameRate"); applyLiveSettingsLater() } }
+    /// Only a new port or a change of the low-latency mode requires restarting the stream
     @Published var port: Int { didSet { save(port, "port") } }
+    /// Expert setting: HTTPS via local-ip.sh so browsers can decode with WebCodecs.
+    /// Needs a router that resolves local-ip.sh (e.g. a FRITZ!Box rebind exception).
+    @Published var lowLatency: Bool { didSet { save(lowLatency, "lowLatency") } }
+    /// State of the HTTPS endpoint while running
+    @Published private(set) var secureStatus: SecureStatus?
+
+    enum SecureStatus: Equatable {
+        case active(expires: Date)
+        case failed(String)
+    }
 
     // MARK: New screens
     @Published var defaultPresetID: String { didSet { save(defaultPresetID, "preset") } }
@@ -91,10 +120,12 @@ final class AppModel: ObservableObject {
     private let defaults = UserDefaults.standard
     private var server: StreamServer?
     private var activePort: Int?
+    private var activeLowLatency: Bool?
     /// Connection → screen (authoritative for codec choice and idling, without waiting for the server)
     private var assignments: [UUID: Int] = [:]
     private var connectionDevice: [UUID: String] = [:]
     private var connectionHEVC: [UUID: Bool] = [:]
+    private var connectionWebRTC: [UUID: Bool] = [:]
     /// Screen explicitly chosen via `?screen=` for a connection
     private var connectionOverride: [UUID: Int] = [:]
     private var idleTasks: [Int: Task<Void, Never>] = [:]
@@ -107,17 +138,89 @@ final class AppModel: ObservableObject {
 
     var globalSettings: GlobalSettings {
         GlobalSettings(fps: fps, mode: mode, quality: quality, deltaUpdates: deltaUpdates,
-                       bitrateMbps: bitrateMbps, adaptive: adaptive, showsCursor: showsCursor)
+                       bitrateMbps: bitrateMbps, adaptive: adaptive, showsCursor: showsCursor,
+                       steadyFrameRate: steadyFrameRate)
     }
 
-    /// Streaming settings apply immediately; only a changed port needs a restart.
+    /// Streaming settings apply immediately; only a changed port or low-latency mode needs a restart.
     var needsRestart: Bool {
         guard isRunning, let activePort else { return false }
-        return activePort != port
+        return activePort != port || activeLowLatency != lowLatency
     }
 
     var fixedScreens: [ScreenSession] { screens.filter { !$0.config.isDeviceScreen } }
     var deviceScreens: [ScreenSession] { screens.filter { $0.config.isDeviceScreen } }
+    /// Screens the current mode can actually use. In “one per device” the regular screens are
+    /// never used – they are hidden and stay switched off.
+    var visibleScreens: [ScreenSession] {
+        switch assignmentMode {
+        case .shared: return screens
+        case .perDevice: return deviceScreens
+        }
+    }
+
+    func isUsable(_ screen: ScreenSession) -> Bool {
+        assignmentMode == .shared || screen.config.isDeviceScreen
+    }
+
+    /// Device screens grouped by computer: several tabs of one browser belong together
+    /// (same stored key), and so do different browsers on the same computer (same address).
+    var deviceGroups: [DeviceGroup] {
+        var order: [String] = []
+        var members: [String: [ScreenSession]] = [:]
+        var platforms: [String: String] = [:]
+        for screen in deviceScreens {
+            let ownerID = screen.config.ownerDeviceID ?? ""
+            let owner = devices.first { $0.id == ownerID }
+            let key = owner?.lastAddress ?? Self.baseDeviceKey(ownerID)
+            if members[key] == nil { order.append(key); members[key] = [] }
+            members[key]?.append(screen)
+            if platforms[key] == nil { platforms[key] = Self.platform(of: owner?.name ?? screen.config.name) }
+        }
+        let titles = order.map { key -> String in
+            if key == "::1" || key == "127.0.0.1" { return "This Mac" }
+            return Self.computerName(platforms[key] ?? "Device")
+        }
+        return order.enumerated().map { index, key in
+            var title = titles[index]
+            // Two computers of the same kind: tell them apart by their address
+            if titles.filter({ $0 == title }).count > 1, key.contains(".") { title += " (\(key))" }
+            return DeviceGroup(id: key, title: title, symbol: DeviceSymbol.name(for: platforms[key] ?? ""),
+                               screens: members[key] ?? [])
+        }
+    }
+
+    /// “Chrome on Windows · Tab 2” → “Chrome · Tab 2” (the computer is shown above it)
+    func browserName(of screen: ScreenSession) -> String {
+        let name = screen.config.name
+        guard let range = name.range(of: " on ") else { return name }
+        let rest = name[range.upperBound...]
+        let tab = rest.range(of: " · ").map { String(rest[$0.lowerBound...]) } ?? ""
+        return String(name[..<range.lowerBound]) + tab
+    }
+
+    private static func baseDeviceKey(_ key: String) -> String {
+        guard let range = key.range(of: #"-tab\d+$"#, options: .regularExpression) else { return key }
+        return String(key[..<range.lowerBound])
+    }
+
+    /// “Chrome on Windows · Tab 2” → “Windows”
+    private static func platform(of name: String) -> String {
+        guard let range = name.range(of: " on ") else { return name }
+        let rest = name[range.upperBound...]
+        return String(rest.split(separator: "·").first ?? Substring(rest)).trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func computerName(_ platform: String) -> String {
+        switch platform {
+        case "Windows": return "Windows PC"
+        case "Linux": return "Linux PC"
+        case "Android": return "Android device"
+        case "ChromeOS": return "Chromebook"
+        default: return platform
+        }
+    }
+
     var primaryScreen: ScreenSession? {
         screens.first { $0.id == primaryScreenID && !$0.config.isDeviceScreen } ?? fixedScreens.first
     }
@@ -139,10 +242,13 @@ final class AppModel: ObservableObject {
         mode = StreamMode(rawValue: d.string(forKey: "mode") ?? "") ?? .videoAuto
         quality = d.object(forKey: "quality") as? Int ?? 70
         deltaUpdates = d.object(forKey: "deltaUpdates") as? Bool ?? true
-        bitrateMbps = d.object(forKey: "bitrateMbps") as? Int ?? 8
+        // A home network easily carries 20 Mbit/s – enough for sharp text; adaptation lowers it on weak Wi-Fi
+        bitrateMbps = d.object(forKey: "bitrateMbps") as? Int ?? 20
         adaptive = d.object(forKey: "adaptive") as? Bool ?? true
         showsCursor = d.object(forKey: "showsCursor") as? Bool ?? true
+        steadyFrameRate = d.object(forKey: "steadyFrameRate") as? Bool ?? true
         port = d.object(forKey: "port") as? Int ?? 8787
+        lowLatency = d.object(forKey: "lowLatency") as? Bool ?? false
         defaultPresetID = d.string(forKey: "preset") ?? DisplayPreset.defaultID
         defaultCustomWidth = d.object(forKey: "customWidth") as? Int ?? 1600
         defaultCustomHeight = d.object(forKey: "customHeight") as? Int ?? 1000
@@ -191,16 +297,32 @@ final class AppModel: ObservableObject {
             state = .stopped
             return
         }
-        guard port >= 1024, port < 65535 else {
-            errorText = "Please choose a port between 1024 and 65534."
+        guard port >= 1024, port <= 65532 else {
+            errorText = "Please choose a port between 1024 and 65532."
             state = .stopped
             return
         }
 
+        // Low-latency mode: HTTPS + secure WebSocket on the next two ports
+        var secure: StreamServer.SecureEndpoint?
+        secureStatus = nil
+        if lowLatency {
+            do {
+                let identity = try await SecureOrigin.load()
+                secure = .init(identity: identity.identity, httpsPort: UInt16(port + 2),
+                               wssPort: UInt16(port + 3), domain: SecureOrigin.domain)
+                secureStatus = .active(expires: identity.expires)
+            } catch {
+                secureStatus = .failed(error.localizedDescription)
+            }
+        }
+
         let server: StreamServer
+        let localAddresses = LocalNetwork.localIPv4Addresses()
         do {
             let page = try ReceiverPage.load()
-            server = StreamServer(httpPort: UInt16(port), wsPort: UInt16(port + 1), pageHTML: page)
+            server = StreamServer(httpPort: UInt16(port), wsPort: UInt16(port + 1), pageHTML: page,
+                                  secure: secure, defaultIPv4: localAddresses.first)
             server.onClientsChanged = { [weak self] infos in
                 Task { @MainActor in self?.clients = infos }
             }
@@ -223,11 +345,12 @@ final class AppModel: ObservableObject {
         self.server = server
         activeGlobal = globalSettings
         activePort = port
-        addresses = LocalNetwork.localIPv4Addresses()
+        activeLowLatency = lowLatency
+        addresses = localAddresses
         state = .running
 
         // Screens are created on demand – only “keep always ready” ones right away
-        for screen in screens where screen.config.keepAlive {
+        for screen in screens where screen.config.keepAlive && isUsable(screen) {
             await ensureRunning(screen)
         }
     }
@@ -247,11 +370,14 @@ final class AppModel: ObservableObject {
         assignments.removeAll()
         connectionDevice.removeAll()
         connectionHEVC.removeAll()
+        connectionWebRTC.removeAll()
         connectionOverride.removeAll()
         clients = []
         addresses = []
         activeGlobal = nil
         activePort = nil
+        activeLowLatency = nil
+        secureStatus = nil
         state = .stopped
     }
 
@@ -307,7 +433,7 @@ final class AppModel: ObservableObject {
     func setKeepAlive(_ screen: ScreenSession, _ keepAlive: Bool) {
         screen.config.keepAlive = keepAlive
         saveScreens()
-        guard isRunning else { return }
+        guard isRunning, isUsable(screen) else { return }
         Task {
             if keepAlive { await ensureRunning(screen) } else { scheduleIdleCheck(screen.id) }
         }
@@ -327,6 +453,12 @@ final class AppModel: ObservableObject {
         let base = "http://\(address):\(activePort ?? port)"
         guard let screen else { return base }
         return base + "/?screen=\(screen.id)"
+    }
+
+    /// HTTPS address of the low-latency mode (the plain address switches there automatically)
+    var secureURL: String? {
+        guard case .active = secureStatus, let address = addresses.first, let activePort else { return nil }
+        return "https://\(SecureOrigin.hostname(for: address)):\(activePort + 2)"
     }
 
     // MARK: Managing devices
@@ -381,16 +513,20 @@ final class AppModel: ObservableObject {
         guard isRunning else { return }
 
         // Remember or recognize the device
+        let address = request.address.isEmpty ? nil : request.address
         if let index = devices.firstIndex(where: { $0.id == request.deviceKey }) {
             devices[index].lastSeen = Date()
+            devices[index].lastAddress = address
         } else {
             devices.append(KnownDevice(id: request.deviceKey, name: request.deviceName,
-                                       pinnedScreenID: nil, ownScreenID: nil, lastSeen: Date()))
+                                       pinnedScreenID: nil, ownScreenID: nil, lastSeen: Date(),
+                                       lastAddress: address))
         }
         saveDevices()
 
         connectionDevice[connection] = request.deviceKey
         connectionHEVC[connection] = request.supportsHEVC
+        connectionWebRTC[connection] = request.supportsWebRTC
         if let wanted = request.screenID, screen(wanted) != nil {
             connectionOverride[connection] = wanted
         }
@@ -406,6 +542,7 @@ final class AppModel: ObservableObject {
         let previous = assignments.removeValue(forKey: connection)
         connectionDevice[connection] = nil
         connectionHEVC[connection] = nil
+        connectionWebRTC[connection] = nil
         connectionOverride[connection] = nil
         if let previous, let screen = screen(previous) {
             scheduleIdleCheck(previous)
@@ -415,12 +552,14 @@ final class AppModel: ObservableObject {
 
     /// Order: 1. `?screen=` in the address, 2. manual assignment, 3. mode
     private func target(for connection: UUID, request: JoinRequest? = nil) -> ScreenSession? {
-        if let override = connectionOverride[connection], let screen = screen(override) {
+        if let override = connectionOverride[connection], let screen = screen(override), isUsable(screen) {
             return screen
         }
         guard let key = connectionDevice[connection],
-              let device = devices.first(where: { $0.id == key }) else { return primaryScreen }
-        if let pinned = screen(device.pinnedScreenID) {
+              let device = devices.first(where: { $0.id == key }) else {
+            return assignmentMode == .shared ? primaryScreen : nil
+        }
+        if let pinned = screen(device.pinnedScreenID), isUsable(pinned) {
             return pinned
         }
         switch assignmentMode {
@@ -435,9 +574,18 @@ final class AppModel: ObservableObject {
         if let existing = screen(device.ownScreenID) { return existing }
         var width: Int? = nil, height: Int? = nil, hiDPI: Bool? = nil
         if autoMatchDevice, let request {
-            width = request.width
-            height = request.height
-            hiDPI = request.pixelRatio >= 1.5
+            if request.pixelRatio >= 1.5 {
+                // Retina/phones: points = CSS pixels, rendered at 2×
+                width = request.width
+                height = request.height
+                hiDPI = true
+            } else {
+                // Windows scaling 125 %/150 % etc.: use the physical pixels 1:1 – otherwise the
+                // browser would stretch a smaller image and text gets blurry
+                width = Int((Double(request.width) * request.pixelRatio).rounded())
+                height = Int((Double(request.height) * request.pixelRatio).rounded())
+                hiDPI = false
+            }
         }
         let screen = addScreen(width: width, height: height, hiDPI: hiDPI,
                                name: device.name, ownerDeviceID: device.id)
@@ -469,6 +617,21 @@ final class AppModel: ObservableObject {
             if assignments[connection] != target.id {
                 await assign(connection, to: target)
             }
+        }
+    }
+
+    /// Switches off screens the current mode never uses (e.g. the regular screens in
+    /// “one per device”) – even if they are set to “Keep Always Ready”.
+    private func deactivateUnusedScreens() async {
+        for screen in screens where !isUsable(screen) {
+            idleTasks[screen.id]?.cancel()
+            idleTasks[screen.id] = nil
+            guard !assignments.values.contains(screen.id) else { continue }
+            if screen.isRunning || screen.isBusy { await screen.stop() }
+        }
+        // Back in a mode that uses them: bring “Keep Always Ready” screens up again
+        for screen in screens where screen.config.keepAlive && isUsable(screen) {
+            await ensureRunning(screen)
         }
     }
 
@@ -521,6 +684,7 @@ final class AppModel: ObservableObject {
     /// If a screen with viewers stops capturing unexpectedly, it is restarted
     /// once automatically – devices stay connected meanwhile.
     private func attach(_ session: ScreenSession) {
+        session.onConfigChanged = { [weak self] in self?.saveScreens() }
         session.onUnexpectedStop = { [weak self, weak session] in
             Task { @MainActor in
                 guard let self, let session else { return }
@@ -546,6 +710,10 @@ final class AppModel: ObservableObject {
     /// “Video auto”: HEVC if all devices on the screen can play it, otherwise H.264
     private func desiredCodec(for screen: ScreenSession) -> StreamCodec {
         switch (activeGlobal ?? globalSettings).mode {
+        case .realtime:
+            // WebRTC needs every viewer on the screen to support it, otherwise H.264 via MSE
+            let viewers = assignments.filter { $0.value == screen.id }.map(\.key)
+            return viewers.allSatisfy { connectionWebRTC[$0] ?? true } ? .webrtc : .h264
         case .jpeg: return .jpeg
         case .h264: return .h264
         case .hevc: return .hevc

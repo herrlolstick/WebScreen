@@ -15,25 +15,38 @@ struct OverviewView: View {
                     ErrorBanner(text: error) { model.errorText = nil }
                 }
                 HStack {
-                    Text("Screens").font(.title3.weight(.semibold))
+                    Text("Screens")
+                        .font(.title3.weight(.semibold))
                     Spacer()
-                    Button {
-                        let screen = model.addScreen()
-                        page = .screen(screen.id)
-                    } label: {
-                        Label("Add", systemImage: "plus")
-                    }
-                    .glassButton()
-                }
-                LazyVGrid(columns: columns, spacing: 16) {
-                    ForEach(model.screens) { screen in
+                    if model.assignmentMode == .shared {
                         Button {
+                            let screen = model.addScreen()
                             page = .screen(screen.id)
                         } label: {
-                            ScreenCard(screen: screen)
+                            Label("Add", systemImage: "plus")
                         }
-                        .buttonStyle(.plain)
+                        .glassButton()
                     }
+                }
+                if model.visibleScreens.isEmpty {
+                    Text("Every browser that opens the address gets its own screen – it shows up here as soon as the device connects.")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(18)
+                        .glassCard(cornerRadius: 20)
+                }
+                if model.assignmentMode == .perDevice {
+                    // Grouped by computer, like the sidebar
+                    ForEach(model.deviceGroups) { group in
+                        VStack(alignment: .leading, spacing: 10) {
+                            Label(group.title, systemImage: group.symbol)
+                                .font(.headline)
+                                .foregroundStyle(.secondary)
+                            grid(group.screens, short: true)
+                        }
+                    }
+                } else {
+                    grid(model.visibleScreens, short: false)
                 }
             }
             .padding(24)
@@ -41,6 +54,19 @@ struct OverviewView: View {
             .frame(maxWidth: .infinity)
         }
         .navigationTitle("Overview")
+    }
+
+    private func grid(_ screens: [ScreenSession], short: Bool) -> some View {
+        LazyVGrid(columns: columns, spacing: 16) {
+            ForEach(screens) { screen in
+                Button {
+                    page = .screen(screen.id)
+                } label: {
+                    ScreenCard(screen: screen, title: short ? model.browserName(of: screen) : nil)
+                }
+                .buttonStyle(.plain)
+            }
+        }
     }
 
     // MARK: Header – slim: status and controls on the left, the code on the right
@@ -60,11 +86,10 @@ struct OverviewView: View {
                 }
 
                 GlassGroup(spacing: 10) {
-                    ViewThatFits(in: .horizontal) {
-                        controls(compact: false)
-                        controls(compact: true)
-                    }
+                    controls
                 }
+
+                modePicker
             }
             .foregroundStyle(.white)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -93,29 +118,39 @@ struct OverviewView: View {
         .animation(.smooth, value: model.state)
     }
 
-    @ViewBuilder
-    private func controls(compact: Bool) -> some View {
+    /// Start/stop, how many screens are active, arrange – nothing else
+    private var controls: some View {
         HStack(spacing: 8) {
-            StatusChip()
-            GlassChip(compact ? "\(model.runningScreenCount)" : "\(model.runningScreenCount) active", systemImage: "display")
-            GlassChip(compact ? "\(model.clients.count)" : "\(model.clients.count) devices", systemImage: "ipad.and.iphone")
-            if !compact {
-                GlassChip(model.assignmentMode == .shared ? "Shared" : "Per device",
-                          systemImage: model.assignmentMode == .shared ? "rectangle.on.rectangle" : "rectangle.split.2x1")
-            }
             StartStopButton()
                 .glassButton(prominent: true)
             if model.isRunning {
+                GlassChip(model.runningScreenCount == 1 ? "1 screen active" : "\(model.runningScreenCount) screens active",
+                          systemImage: "display")
                 Button {
                     model.openDisplaySettings()
                 } label: {
-                    Image(systemName: "rectangle.3.group")
+                    Label("Arrange", systemImage: "rectangle.3.group")
                 }
                 .glassButton()
-                .help("Arrange displays")
+                .help("Arrange the screens next to your Mac in System Settings")
             }
         }
         .fixedSize()
+    }
+
+    /// The one decision a beginner has to make – as an obvious switch
+    private var modePicker: some View {
+        HStack(spacing: 10) {
+            Text("Each device shows")
+                .font(.callout.weight(.medium))
+            Picker("Each device shows", selection: $model.assignmentMode) {
+                Text("the same screen").tag(AssignmentMode.shared)
+                Text("its own screen").tag(AssignmentMode.perDevice)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+        }
     }
 
     private var subtitle: String {
@@ -136,6 +171,7 @@ struct OverviewView: View {
 struct ScreenCard: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject var screen: ScreenSession
+    var title: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -167,7 +203,7 @@ struct ScreenCard: View {
             HStack(spacing: 8) {
                 Image(systemName: screen.config.isDeviceScreen ? "ipad.landscape" : "display")
                     .foregroundStyle(screen.isRunning ? Color.green : Color.secondary)
-                Text(screen.config.name)
+                Text(title ?? screen.config.name)
                     .font(.headline)
                     .lineLimit(1)
                     .truncationMode(.middle)

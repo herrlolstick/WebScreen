@@ -123,6 +123,23 @@ final class VirtualDisplayManager {
         )
     }
 
+    /// Moves a display to the right end of the arrangement, top-aligned with the
+    /// main display – so new device screens line up next to each other instead of
+    /// wherever macOS puts them. Saved permanently, so later changes by the user stick.
+    static func placeRightOfOtherDisplays(_ displayID: CGDirectDisplayID) {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 32)
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(32, &ids, &count) == .success else { return }
+        let others = ids.prefix(Int(count)).filter { $0 != displayID && CGDisplayMirrorsDisplay($0) == kCGNullDirectDisplay }
+        guard let rightEdge = others.map({ CGDisplayBounds($0).maxX }).max() else { return }
+        let top = CGDisplayBounds(CGMainDisplayID()).minY
+
+        var config: CGDisplayConfigRef?
+        guard CGBeginDisplayConfiguration(&config) == .success, let config else { return }
+        CGConfigureDisplayOrigin(config, displayID, Int32(rightEdge), Int32(top))
+        _ = CGCompleteDisplayConfiguration(config, .permanently)
+    }
+
     func destroy() {
         display = nil // Releasing it removes the display
     }

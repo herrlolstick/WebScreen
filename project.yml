@@ -1,0 +1,58 @@
+# Xcode project definition – generate WebScreen.xcodeproj with:
+#   xcodegen generate
+# (brew install xcodegen). The generated project is committed as well, so
+# opening WebScreen.xcodeproj works without XcodeGen.
+name: WebScreen
+options:
+  bundleIdPrefix: de.lolstick
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: 566V5MVR96
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: 0.2.0
+    CURRENT_PROJECT_VERSION: 2
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+packages:
+  WebRTC:
+    url: https://github.com/stasel/WebRTC.git
+    exactVersion: 156.0.0
+
+targets:
+  WebScreen:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/WebScreen
+      - path: Sources/CGVirtualDisplayBridge/include
+        buildPhase: none
+      - path: Resources/index.html
+        buildPhase: resources
+      - path: Resources/Assets.xcassets
+    dependencies:
+      - package: WebRTC
+      - sdk: ScreenCaptureKit.framework
+      - sdk: CoreImage.framework
+      - sdk: CoreMedia.framework
+      - sdk: VideoToolbox.framework
+      - sdk: Network.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: de.lolstick.WebScreen
+        PRODUCT_NAME: WebScreen
+        INFOPLIST_FILE: Support/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_HARDENED_RUNTIME: YES
+        SWIFT_INCLUDE_PATHS: $(SRCROOT)/Sources/CGVirtualDisplayBridge/include
+        HEADER_SEARCH_PATHS: $(SRCROOT)/Sources/CGVirtualDisplayBridge/include
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+        COMBINE_HIDPI_IMAGES: YES
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+    scheme:
+      testTargets: []

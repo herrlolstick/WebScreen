@@ -9,9 +9,14 @@ import VideoToolbox
 /// Packets (big endian):
 ///   Init:   [u8 type=2][u8 codec string length][codec string ASCII][init segment (ftyp+moov)]
 ///   Frame:  [u8 type=3][u8 keyframe?][media segment (moof+mdat)]
+///
+/// Additionally for WebCodecs receivers (no container, decoded immediately):
+///   Config: [u8 type=5][u8 codec string length][codec string ASCII][avcC/hvcC description]
+///   Frame:  [u8 type=4][u8 keyframe?][u64 timestamp µs][access unit, length-prefixed NALUs]
 final class VideoPipeline: FramePipelineProtocol {
-    var onPacket: ((Data, Bool) -> Void)?
-    var onInit: ((Data) -> Void)?
+    var onPacket: ((Data, Data?, Bool) -> Void)?
+    /// Init segment for MSE and decoder configuration for WebCodecs
+    var onInit: ((Data, Data) -> Void)?
     var hasReceivers: () -> Bool = { true }
 
     private let queue = DispatchQueue(label: "webscreen.h264", qos: .userInteractive)
@@ -24,8 +29,25 @@ final class VideoPipeline: FramePipelineProtocol {
     private var forceKey = true
     private var lastSyncRequest: UInt64 = 0
     private var stopped = false
+    // Steady frame rate: repeat the last frame while nothing changes, so the browser's
+    // player never runs dry and movement starts without a hitch (see `WebRTCPipeline`)
+    private var steadyTimer: DispatchSourceTimer?
+    private var lastFrameTime = DispatchTime.now()
+    private let frameInterval: Double
+    private var lastPTS = CMTime.negativeInfinity
+    private var steady = false
 
-    init(codec: StreamCodec, width: Int, height: Int, fps: Int, bitrate: Int, adaptive: AdaptiveController) throws {
+    /// Repeated and captured frames mix – timestamps must still only go forward
+    private func monotonic(_ pts: CMTime) -> CMTime {
+        let minimum = lastPTS.isNumeric ? CMTimeAdd(lastPTS, CMTime(value: 1, timescale: 1000)) : pts
+        let result = (pts.isNumeric && CMTimeCompare(pts, minimum) > 0) ? pts : minimum
+        lastPTS = result
+        return result
+    }
+
+    init(codec: StreamCodec, width: Int, height: Int, fps: Int, bitrate: Int, adaptive: AdaptiveController,
+         steady: Bool) throws {
+        frameInterval = 1.0 / Double(max(fps, 1))
         self.adaptive = adaptive
         self.maxBitrate = bitrate
         self.appliedBitrate = bitrate
@@ -39,19 +61,63 @@ final class VideoPipeline: FramePipelineProtocol {
             var packet = Data([2, UInt8(codecString.utf8.count)])
             packet.append(Data(codecString.utf8))
             packet.append(self.muxer.initSegment(config: config))
-            self.onInit?(packet)
+            var raw = Data([5, UInt8(codecString.utf8.count)])
+            raw.append(Data(codecString.utf8))
+            raw.append(config)
+            self.onInit?(packet, raw)
         }
-        encoder.onFrame = { [weak self] sample, isKey in
+        encoder.onFrame = { [weak self] sample, isKey, pts in
             guard let self else { return }
             var packet = Data([3, isKey ? 1 : 0])
             packet.append(self.muxer.mediaSegment(sample: sample, isKey: isKey))
-            self.onPacket?(packet, isKey)
+            var raw = Data([4, isKey ? 1 : 0])
+            let micros = pts.isNumeric ? UInt64(max(0, pts.seconds * 1_000_000)) : 0
+            raw.appendBE(micros)
+            raw.append(sample)
+            self.onPacket?(packet, raw, isKey)
         }
+        self.steady = steady
+        if steady { startSteadyTimer() }
     }
 
     /// Current target bitrate in bit/s
     var currentBitrate: Int {
         max(1_000_000, Int(Double(maxBitrate) * adaptive.level))
+    }
+
+    private func startSteadyTimer() {
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+        timer.schedule(deadline: .now() + frameInterval / 2, repeating: frameInterval / 2, leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in self?.repeatIfIdle() }
+        timer.resume()
+        steadyTimer = timer
+    }
+
+    /// Runs on `queue`
+    private func repeatIfIdle() {
+        guard !stopped, let pixelBuffer = lastPixelBuffer, hasReceivers(), intervalElapsed else { return }
+        encodeNow(pixelBuffer, pts: CMClockGetTime(CMClockGetHostTimeClock()))
+        lastWasRepeat = true
+    }
+
+    /// The fMP4 muxer gives every frame the same duration (1/fps). More frames per second
+    /// than that would make the video run ahead of real time and the browser buffer
+    /// (= latency) grow – so a repeat only goes out when a whole interval passed without
+    /// any frame (captured frames are limited to the frame rate by ScreenCaptureKit).
+    private var intervalElapsed: Bool {
+        // Captured frames jitter a little – only fill in once they have clearly stopped,
+        // then keep repeating at the frame rate
+        let factor = lastWasRepeat ? 0.95 : 1.5
+        return DispatchTime.now().uptimeNanoseconds - lastFrameTime.uptimeNanoseconds > UInt64(frameInterval * factor * 1e9)
+    }
+    private var lastWasRepeat = false
+
+    private func encodeNow(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
+        lastFrameTime = .now()
+        applyBitrateIfNeeded()
+        let key = forceKey
+        forceKey = false
+        encoder.encode(pixelBuffer, pts: monotonic(pts), forceKeyFrame: key)
     }
 
     func submit(_ pixelBuffer: CVPixelBuffer, pts: CMTime) {
@@ -62,10 +128,9 @@ final class VideoPipeline: FramePipelineProtocol {
                 self.forceKey = true
                 return
             }
-            self.applyBitrateIfNeeded()
-            let key = self.forceKey
-            self.forceKey = false
-            self.encoder.encode(pixelBuffer, pts: pts, forceKeyFrame: key)
+            // Captured frames always go out right away – only repeats give way
+            self.lastWasRepeat = false
+            self.encodeNow(pixelBuffer, pts: pts)
         }
     }
 
@@ -79,11 +144,12 @@ final class VideoPipeline: FramePipelineProtocol {
                 return
             }
             self.lastSyncRequest = now
-            self.encoder.encode(pixelBuffer, pts: CMClockGetTime(CMClockGetHostTimeClock()), forceKeyFrame: true)
+            self.encoder.encode(pixelBuffer, pts: self.monotonic(CMClockGetTime(CMClockGetHostTimeClock())), forceKeyFrame: true)
         }
     }
 
     func stop() {
+        steadyTimer?.cancel()
         queue.sync {
             stopped = true
             encoder.invalidate()
@@ -137,30 +203,46 @@ final class VideoPipeline: FramePipelineProtocol {
 
 final class VideoEncoder {
     var onConfig: ((Data) -> Void)?
-    var onFrame: ((Data, Bool) -> Void)?
+    var onFrame: ((Data, Bool, CMTime) -> Void)?
 
     private var session: VTCompressionSession?
     private var lastPTS: CMTime?
     private var lastDescription: Data?
 
     private let configKey: String
+    /// Whether the session runs with low-latency rate control
+    private(set) var isLowLatency = false
 
     init(hevc: Bool, width: Int, height: Int, fps: Int, bitrate: Int) throws {
         configKey = hevc ? "hvcC" : "avcC"
-        let spec = [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String: true] as CFDictionary
+        // Low-latency rate control: no lookahead, every frame leaves the encoder as soon
+        // as it is done. Falls back to the normal mode where the hardware can't do it.
         var session: VTCompressionSession?
-        let status = VTCompressionSessionCreate(
-            allocator: nil, width: Int32(width), height: Int32(height),
-            codecType: hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264, encoderSpecification: spec,
-            imageBufferAttributes: nil, compressedDataAllocator: nil,
-            outputCallback: nil, refcon: nil, compressionSessionOut: &session
-        )
+        var status: OSStatus = noErr
+        for lowLatency in [true, false] {
+            var spec: [String: Any] = [kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder as String: true]
+            if lowLatency { spec[kVTVideoEncoderSpecification_EnableLowLatencyRateControl as String] = true }
+            status = VTCompressionSessionCreate(
+                allocator: nil, width: Int32(width), height: Int32(height),
+                codecType: hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
+                encoderSpecification: spec as CFDictionary,
+                imageBufferAttributes: nil, compressedDataAllocator: nil,
+                outputCallback: nil, refcon: nil, compressionSessionOut: &session
+            )
+            if status == noErr, session != nil {
+                isLowLatency = lowLatency
+                break
+            }
+        }
         guard status == noErr, let session else { throw WebScreenError.encoderFailed(status) }
 
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel,
                              value: hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
+        // Never hold frames back inside the encoder
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFNumber)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFNumber)
         // Regular keyframes so the browser recovers quickly after dropouts
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: (fps * 4) as CFNumber)
@@ -231,7 +313,7 @@ final class VideoEncoder {
             return CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: base)
         }
         guard status == noErr else { return }
-        onFrame?(data, isKey)
+        onFrame?(data, isKey, sampleBuffer.presentationTimeStamp)
     }
 }
 

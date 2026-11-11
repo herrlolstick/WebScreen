@@ -282,7 +282,9 @@ struct ConnectionRow: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
             Spacer(minLength: 8)
-            Text("\(Int(client.fps)) fps · " + String(format: "%.1f Mbit/s", client.mbps))
+            // Nothing moving on the screen → no new frames; say so instead of a bare “0 fps”
+            Text(client.fps < 0.5 ? "Still image – nothing changes"
+                                  : "\(Int(client.fps.rounded())) fps · " + String(format: "%.1f Mbit/s", client.mbps))
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)

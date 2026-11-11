@@ -7,6 +7,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    /// Right-click on the Dock icon
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let menu = NSMenu()
+        let item = NSMenuItem(title: "Settings …", action: #selector(openSettings), keyEquivalent: "")
+        item.target = self
+        menu.addItem(item)
+        return menu
+    }
+
+    @MainActor @objc private func openSettings() {
+        SettingsOpener.open?()
+    }
+
     /// Clicking the Dock icon reopens the window.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         if !flag {
@@ -42,6 +55,11 @@ struct WebScreenApp: App {
 
                 Button("Arrange Displays …") { model.openDisplaySettings() }
             }
+        }
+
+        Settings {
+            SettingsView()
+                .environmentObject(model)
         }
 
         MenuBarExtra(isInserted: $showMenuBarIcon) {
@@ -91,6 +109,11 @@ private struct MenuBarContent: View {
                     StartStopButton()
                         .glassButton(prominent: true)
                     Spacer()
+                    SettingsLink {
+                        Image(systemName: "gearshape")
+                    }
+                    .glassButton()
+                    .help("Settings")
                     Button("Open Window") {
                         openWindow(id: "main")
                         NSApp.activate(ignoringOtherApps: true)

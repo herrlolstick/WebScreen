@@ -22,11 +22,15 @@ struct JoinRequest {
     /// Explicitly requested screen (from `?screen=` in the address)
     var screenID: Int?
     var supportsHEVC: Bool
+    /// Browser has `RTCPeerConnection` (real-time mode)
+    var supportsWebRTC: Bool
     /// Screen size of the device in CSS pixels (points) and pixel ratio
     var width: Int
     var height: Int
     var pixelRatio: Double
     var deviceName: String
+    /// Network address – browsers on the same computer share it
+    var address: String = ""
 }
 
 /// An HTTP server for the receiver page and a WebSocket server for the image data –
@@ -49,6 +53,11 @@ final class StreamServer {
         var codec: StreamCodec
         var onSyncNeeded: () -> Void
         var onCongestion: (Bool) -> Void
+        /// WebRTC: a device now watches / no longer watches this screen
+        var onClientAttached: (UUID) -> Void = { _ in }
+        var onClientDetached: (UUID) -> Void = { _ in }
+        /// WebRTC: signaling message (JSON) from a device on this screen
+        var onSignal: (UUID, String) -> Void = { _, _ in }
     }
 
     private final class Client {
@@ -59,7 +68,13 @@ final class StreamServer {
         var deviceName = "Browser"
         var deviceKey = ""
         var supportsHEVC = false
+        /// Decodes with WebCodecs and gets raw access units instead of fMP4
+        var webCodecs = false
+        var supportsWebRTC = false
         var screenID: Int?
+        /// Heartbeat: last sign of life from a page that sends pings
+        var lastHeard = Date()
+        var sendsPings = false
         var inflight = 0
         var needsSync = true
         var skipped = 0
@@ -67,6 +82,10 @@ final class StreamServer {
         var bytes = 0
         var fps = 0.0
         var mbps = 0.0
+        /// Real-time mode: the media bypasses this server, so the page reports what it receives
+        var reportedFps = 0.0
+        var reportedMbps = 0.0
+        var reportedAt: Date?
 
         init(_ connection: NWConnection) {
             self.connection = connection
@@ -95,13 +114,14 @@ final class StreamServer {
     private let queue = DispatchQueue(label: "webscreen.server", qos: .userInteractive)
     private let httpPort: UInt16
     private let wsPort: UInt16
+    private let secure: SecureEndpoint?
     private let page: Data
-    private var httpListener: NWListener?
-    private var wsListener: NWListener?
+    private var listeners: [NWListener] = []
     private var statsTimer: DispatchSourceTimer?
     private var clients: [UUID: Client] = [:]
     private var channels: [Int: ScreenChannel] = [:]
     private var initPackets: [Int: Data] = [:]
+    private var initPacketsRaw: [Int: Data] = [:]
     private var syncPending: Set<Int> = []
     private var lastSync: [Int: UInt64] = [:]
 
@@ -109,70 +129,108 @@ final class StreamServer {
     private let countLock = NSLock()
     private var receiverCounts: [Int: Int] = [:]
 
-    init(httpPort: UInt16, wsPort: UInt16, pageHTML: String) {
+    /// HTTPS page + secure WebSocket (needed for WebCodecs, see `SecureOrigin`)
+    struct SecureEndpoint {
+        let identity: sec_identity_t
+        let httpsPort: UInt16
+        let wssPort: UInt16
+        /// Hostname suffix, e.g. "local-ip.sh"
+        let domain: String
+    }
+
+    init(httpPort: UInt16, wsPort: UInt16, pageHTML: String, secure: SecureEndpoint? = nil, defaultIPv4: String? = nil) {
         self.httpPort = httpPort
         self.wsPort = wsPort
-        self.page = Data(pageHTML.replacingOccurrences(of: "__WS_PORT__", with: String(wsPort)).utf8)
+        self.secure = secure
+        let html = pageHTML
+            .replacingOccurrences(of: "__WS_PORT__", with: String(wsPort))
+            .replacingOccurrences(of: "__SECURE_PORT__", with: secure.map { String($0.httpsPort) } ?? "")
+            .replacingOccurrences(of: "__WSS_PORT__", with: secure.map { String($0.wssPort) } ?? "")
+            .replacingOccurrences(of: "__SECURE_DOMAIN__", with: secure?.domain ?? "")
+            .replacingOccurrences(of: "__SECURE_HOST__", with: defaultIPv4 ?? "")
+        self.page = Data(html.utf8)
     }
 
     // MARK: Start/stop
 
     func start() throws {
-        let httpPort = self.httpPort
-        let wsPort = self.wsPort
-
-        let httpParams = NWParameters.tcp
-        httpParams.allowLocalEndpointReuse = true
-        let http = try NWListener(using: httpParams, on: NWEndpoint.Port(rawValue: httpPort)!)
-        http.newConnectionHandler = { [weak self] in self?.handleHTTP($0) }
-        http.stateUpdateHandler = { [weak self] state in
-            if case .failed(let error) = state {
-                self?.onError?("Port \(httpPort) is not available: \(error.localizedDescription)")
-            }
+        var created = [
+            try makeListener(port: httpPort, tls: nil, webSocket: false),
+            try makeListener(port: wsPort, tls: nil, webSocket: true),
+        ]
+        if let secure {
+            created.append(try makeListener(port: secure.httpsPort, tls: secure.identity, webSocket: false))
+            created.append(try makeListener(port: secure.wssPort, tls: secure.identity, webSocket: true))
         }
-
-        let wsParams = NWParameters.tcp
-        wsParams.allowLocalEndpointReuse = true
-        if let tcp = wsParams.defaultProtocolStack.transportProtocol as? NWProtocolTCP.Options {
-            tcp.noDelay = true
-        }
-        let wsOptions = NWProtocolWebSocket.Options()
-        wsOptions.autoReplyPing = true
-        wsParams.defaultProtocolStack.applicationProtocols.insert(wsOptions, at: 0)
-        let ws = try NWListener(using: wsParams, on: NWEndpoint.Port(rawValue: wsPort)!)
-        ws.newConnectionHandler = { [weak self] in self?.handleWebSocket($0) }
-        ws.stateUpdateHandler = { [weak self] state in
-            if case .failed(let error) = state {
-                self?.onError?("Port \(wsPort) is not available: \(error.localizedDescription)")
-            }
-        }
-
-        http.start(queue: queue)
-        ws.start(queue: queue)
-        httpListener = http
-        wsListener = ws
+        for listener in created { listener.start(queue: queue) }
+        listeners = created
 
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 1, repeating: 1)
-        timer.setEventHandler { [weak self] in self?.updateStats() }
+        timer.setEventHandler { [weak self] in
+            self?.updateStats()
+            self?.heartbeat()
+        }
         timer.resume()
         statsTimer = timer
+    }
+
+    /// Lets pages notice a dead connection (e.g. Wi-Fi gone, Mac asleep) quickly and
+    /// drops pages that stopped answering, so their screens can idle out.
+    private func heartbeat() {
+        let now = Date()
+        for client in clients.values {
+            if client.sendsPings, now.timeIntervalSince(client.lastHeard) > 10 {
+                client.connection.cancel()
+                continue
+            }
+            sendText(#"{"type":"ping"}"#, to: client)
+        }
     }
 
     func stop() {
         queue.sync {
             statsTimer?.cancel()
             statsTimer = nil
-            httpListener?.cancel()
-            wsListener?.cancel()
-            httpListener = nil
-            wsListener = nil
+            for listener in listeners { listener.cancel() }
+            listeners.removeAll()
             for client in clients.values { client.connection.cancel() }
             clients.removeAll()
             channels.removeAll()
             initPackets.removeAll()
+            initPacketsRaw.removeAll()
             notifyClients()
         }
+    }
+
+    private func makeListener(port: UInt16, tls identity: sec_identity_t?, webSocket: Bool) throws -> NWListener {
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        let params: NWParameters
+        if let identity {
+            let tls = NWProtocolTLS.Options()
+            sec_protocol_options_set_local_identity(tls.securityProtocolOptions, identity)
+            sec_protocol_options_set_min_tls_protocol_version(tls.securityProtocolOptions, .TLSv12)
+            params = NWParameters(tls: tls, tcp: tcp)
+        } else {
+            params = NWParameters(tls: nil, tcp: tcp)
+        }
+        params.allowLocalEndpointReuse = true
+        if webSocket {
+            let options = NWProtocolWebSocket.Options()
+            options.autoReplyPing = true
+            params.defaultProtocolStack.applicationProtocols.insert(options, at: 0)
+        }
+        let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+        listener.newConnectionHandler = { [weak self] connection in
+            if webSocket { self?.handleWebSocket(connection) } else { self?.handleHTTP(connection) }
+        }
+        listener.stateUpdateHandler = { [weak self] state in
+            if case .failed(let error) = state {
+                self?.onError?("Port \(port) is not available: \(error.localizedDescription)")
+            }
+        }
+        return listener
     }
 
     // MARK: Screens
@@ -187,6 +245,7 @@ final class StreamServer {
             self.channels[id] = channel
             guard announce || !known else { return }
             self.initPackets[id] = nil
+            self.initPacketsRaw[id] = nil
             // Greet devices that are already waiting for this screen
             for client in self.clients.values where client.screenID == id {
                 self.welcome(client)
@@ -201,11 +260,12 @@ final class StreamServer {
         queue.async {
             self.channels[id] = nil
             self.initPackets[id] = nil
+            self.initPacketsRaw[id] = nil
             let message = detachClients
                 ? #"{"type":"waiting","message":"This screen was removed."}"#
                 : #"{"type":"waiting","message":"Setting up the screen again …"}"#
             for client in self.clients.values where client.screenID == id {
-                if detachClients { client.screenID = nil }
+                if detachClients { self.moveClient(client, to: nil) } else { self.channels[id]?.onClientDetached(client.id) }
                 client.needsSync = true
                 self.sendText(message, to: client)
             }
@@ -217,7 +277,7 @@ final class StreamServer {
     func assign(_ clientID: UUID, to screenID: Int) {
         queue.async {
             guard let client = self.clients[clientID] else { return }
-            client.screenID = screenID
+            self.moveClient(client, to: screenID)
             self.notifyClients()
             if self.channels[screenID] != nil {
                 self.welcome(client)
@@ -248,18 +308,20 @@ final class StreamServer {
 
     // MARK: Streaming
 
-    /// Init segment (video only): stored and sent to new devices first
-    func setInit(_ packet: Data, screen id: Int) {
+    /// Init segment (video only): stored and sent to new devices first.
+    /// `raw` is the decoder configuration for WebCodecs receivers.
+    func setInit(_ packet: Data, raw: Data?, screen id: Int) {
         queue.async {
             self.initPackets[id] = packet
+            self.initPacketsRaw[id] = raw
             for client in self.clients.values where client.screenID == id {
                 client.needsSync = true
-                self.sendBinary(packet, to: client, counted: false)
+                self.sendBinary(client.webCodecs ? (raw ?? packet) : packet, to: client, counted: false)
             }
         }
     }
 
-    func broadcast(_ packet: Data, isSync: Bool, screen id: Int) {
+    func broadcast(_ packet: Data, raw: Data? = nil, isSync: Bool, screen id: Int) {
         queue.async {
             for client in self.clients.values where client.screenID == id {
                 if client.needsSync && !isSync { continue }
@@ -270,9 +332,26 @@ final class StreamServer {
                 }
                 if isSync { client.needsSync = false }
                 client.frames += 1
-                client.bytes += packet.count
-                self.sendBinary(packet, to: client, counted: true)
+                let payload = client.webCodecs ? (raw ?? packet) : packet
+                client.bytes += payload.count
+                self.sendBinary(payload, to: client, counted: true)
             }
+        }
+    }
+
+    /// Changes a device's screen and tells the screen it leaves (WebRTC closes the peer)
+    private func moveClient(_ client: Client, to screenID: Int?) {
+        if let old = client.screenID, old != screenID {
+            channels[old]?.onClientDetached(client.id)
+        }
+        client.screenID = screenID
+    }
+
+    /// WebRTC signaling towards a device
+    func sendSignal(_ json: String, to clientID: UUID) {
+        queue.async {
+            guard let client = self.clients[clientID] else { return }
+            self.sendText(json, to: client)
         }
     }
 
@@ -283,9 +362,10 @@ final class StreamServer {
         if let data = try? JSONSerialization.data(withJSONObject: hello), let json = String(data: data, encoding: .utf8) {
             sendText(json, to: client)
         }
-        if let initPacket = initPackets[screenID] {
+        if let initPacket = client.webCodecs ? (initPacketsRaw[screenID] ?? initPackets[screenID]) : initPackets[screenID] {
             sendBinary(initPacket, to: client, counted: false)
         }
+        channel.onClientAttached(client.id)   // WebRTC: send the offer
         requestSync(screen: screenID)
     }
 
@@ -293,8 +373,13 @@ final class StreamServer {
         guard !clients.isEmpty else { return }
         var congestion: [Int: Bool] = [:]
         for client in clients.values {
-            client.fps = Double(client.frames)
-            client.mbps = Double(client.bytes) * 8 / 1_000_000
+            if client.frames == 0, let reportedAt = client.reportedAt, Date().timeIntervalSince(reportedAt) < 3 {
+                client.fps = client.reportedFps
+                client.mbps = client.reportedMbps
+            } else {
+                client.fps = Double(client.frames)
+                client.mbps = Double(client.bytes) * 8 / 1_000_000
+            }
             if let screenID = client.screenID {
                 // Only count real, significant dropouts (more than 10 % of frames skipped).
                 // A full send buffer at the moment of measuring is normal at 60 fps.
@@ -350,6 +435,10 @@ final class StreamServer {
             let response: Data
             if path == "/" || path.hasPrefix("/?") || path.hasPrefix("/index.html") {
                 response = Self.httpResponse(status: "200 OK", type: "text/html; charset=utf-8", body: self.page)
+            } else if path.hasPrefix("/ping") {
+                // Lets the plain-HTTP page check whether the HTTPS address is reachable
+                response = Self.httpResponse(status: "204 No Content", type: "text/plain", body: Data(),
+                                             extraHeaders: "Access-Control-Allow-Origin: *\r\n")
             } else {
                 response = Self.httpResponse(status: "404 Not Found", type: "text/plain; charset=utf-8",
                                              body: Data("Not found".utf8))
@@ -358,8 +447,8 @@ final class StreamServer {
         }
     }
 
-    private static func httpResponse(status: String, type: String, body: Data) -> Data {
-        let header = "HTTP/1.1 \(status)\r\n" +
+    private static func httpResponse(status: String, type: String, body: Data, extraHeaders: String = "") -> Data {
+        let header = "HTTP/1.1 \(status)\r\n" + extraHeaders +
             "Content-Type: \(type)\r\n" +
             "Content-Length: \(body.count)\r\n" +
             "Cache-Control: no-store\r\n" +
@@ -387,6 +476,7 @@ final class StreamServer {
             case .cancelled:
                 if let removed = self.clients.removeValue(forKey: id) {
                     self.notifyClients()
+                    if let screenID = removed.screenID { self.channels[screenID]?.onClientDetached(id) }
                     self.onLeave?(id, removed.screenID)
                 }
             default:
@@ -409,8 +499,20 @@ final class StreamServer {
                 client.connection.cancel()
                 return
             }
+            client.lastHeard = Date()
             if let data, let text = String(data: data, encoding: .utf8) {
-                if text == "sync" {
+                if text == "ping" {
+                    client.sendsPings = true
+                } else if text.hasPrefix("stats:") {
+                    let object = (try? JSONSerialization.jsonObject(with: Data(text.dropFirst(6).utf8))) as? [String: Any]
+                    client.reportedFps = (object?["fps"] as? NSNumber)?.doubleValue ?? 0
+                    client.reportedMbps = (object?["mbps"] as? NSNumber)?.doubleValue ?? 0
+                    client.reportedAt = Date()
+                } else if text.hasPrefix("rtc:") {
+                    if let screenID = client.screenID {
+                        self.channels[screenID]?.onSignal(client.id, String(text.dropFirst(4)))
+                    }
+                } else if text == "sync" {
                     client.needsSync = true
                     if let screenID = client.screenID { self.requestSync(screen: screenID) }
                 } else if text.hasPrefix("join:") {
@@ -425,16 +527,24 @@ final class StreamServer {
         let object = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] ?? [:]
         let ua = object["ua"] as? String ?? ""
         client.deviceName = Self.deviceName(fromUserAgent: ua)
+        // Further WebScreen tabs in the same browser are devices of their own
+        if let tab = (object["tab"] as? NSNumber)?.intValue, tab > 1 {
+            client.deviceName += " · Tab \(tab)"
+        }
         client.deviceKey = (object["device"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? client.id.uuidString
         client.supportsHEVC = (object["hevc"] as? Bool) ?? false
+        client.webCodecs = (object["wc"] as? Bool) ?? false
+        client.supportsWebRTC = (object["rtc"] as? Bool) ?? false
         let request = JoinRequest(
             deviceKey: client.deviceKey,
             screenID: (object["screen"] as? NSNumber)?.intValue,
             supportsHEVC: client.supportsHEVC,
+            supportsWebRTC: client.supportsWebRTC,
             width: (object["width"] as? NSNumber)?.intValue ?? 1280,
             height: (object["height"] as? NSNumber)?.intValue ?? 800,
             pixelRatio: (object["dpr"] as? NSNumber)?.doubleValue ?? 1,
-            deviceName: client.deviceName
+            deviceName: client.deviceName,
+            address: client.address
         )
         notifyClients()
         onJoin?(client.id, request)

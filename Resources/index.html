@@ -28,6 +28,15 @@
     font: 13px -apple-system, system-ui, sans-serif; color: #fff; background: rgba(40,40,40,.85);
     border: 1px solid rgba(255,255,255,.15); border-radius: 8px; padding: 7px 12px; cursor: pointer;
   }
+  #screenName {
+    font: 600 13px -apple-system, system-ui, sans-serif; color: #fff; background: rgba(40,40,40,.85);
+    border: 1px solid rgba(255,255,255,.15); border-radius: 8px; padding: 7px 12px; white-space: nowrap;
+  }
+  #screenName:empty, #scaleHint:empty { display: none; }
+  #scaleHint {
+    font: 13px -apple-system, system-ui, sans-serif; color: #ffd27a; background: rgba(40,40,40,.85);
+    border: 1px solid rgba(255,210,122,.3); border-radius: 8px; padding: 7px 12px; white-space: nowrap;
+  }
   #stats {
     position: fixed; left: 10px; bottom: 10px; display: none; padding: 5px 8px; border-radius: 6px;
     font: 12px ui-monospace, Menlo, monospace; color: #7f7; background: rgba(0,0,0,.65); white-space: pre;
@@ -39,6 +48,8 @@
 <video id="video" muted autoplay playsinline disablepictureinpicture></video>
 <div id="overlay"><h1>WebScreen</h1><div id="message">Connecting …</div></div>
 <div id="toolbar">
+  <span id="scaleHint"></span>
+  <span id="screenName"></span>
   <button id="btnFullscreen">Fullscreen</button>
   <button id="btnStats">Stats</button>
 </div>
@@ -47,6 +58,18 @@
 <script>
 "use strict";
 const WS_PORT = "__WS_PORT__";
+// Low-latency mode (empty when it is off in WebScreen)
+const SECURE_PORT = "__SECURE_PORT__";
+const WSS_PORT = "__WSS_PORT__";
+const SECURE_DOMAIN = "__SECURE_DOMAIN__";
+const SECURE_HOST = "__SECURE_HOST__";
+
+const isSecurePage = location.protocol === "https:";
+// WebCodecs only exists in secure contexts (HTTPS). There every video frame is
+// decoded and drawn the moment it arrives – no media buffer in between.
+// `?nowc` (testing): behave like a plain http:// page on the LAN, i.e. without WebCodecs
+const useWebCodecs = window.isSecureContext && typeof window.VideoDecoder === "function"
+  && typeof window.EncodedVideoChunk === "function" && !new URLSearchParams(location.search).has("nowc");
 
 const canvas = document.getElementById("screen");
 const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
@@ -57,7 +80,7 @@ const toolbar = document.getElementById("toolbar");
 const statsEl = document.getElementById("stats");
 
 let ws = null;
-let mode = null;            // "jpeg" | "h264" | "hevc"
+let mode = null;            // "webrtc" | "jpeg" | "h264" | "hevc"
 let reconnectTimer = null;
 const stats = { frames: 0, bytes: 0, skipped: 0, since: performance.now() };
 
@@ -69,8 +92,10 @@ const isVideoMode = (m) => m === "h264" || m === "hevc";
 
 function setMode(newMode) {
   mode = newMode;
-  canvas.style.display = mode === "jpeg" ? "block" : "none";
-  video.style.display = isVideoMode(mode) ? "block" : "none";
+  const drawsOnCanvas = mode === "jpeg" || (isVideoMode(mode) && useWebCodecs);
+  canvas.style.display = drawsOnCanvas ? "block" : "none";
+  video.style.display = mode === "webrtc" || (isVideoMode(mode) && !useWebCodecs) ? "block" : "none";
+  resetRTC();
   resetJpeg();
   resetVideo();
 }
@@ -164,6 +189,7 @@ let mediaSource = null, sourceBuffer = null, codec = null;
 let initSegment = null, segmentQueue = [], waitingForKey = true;
 
 function resetVideo() {
+  resetDecoder();
   if (mediaSource) {
     try { if (mediaSource.readyState === "open") mediaSource.endOfStream(); } catch (_) {}
   }
@@ -253,14 +279,226 @@ function trimBuffer(force) {
   }
 }
 
-// Keep latency low: always play close to the end of the buffer
+// ───────────── H.264 / HEVC via WebCodecs (secure context only) ─────────────
+// Config: [5][len][codec][avcC/hvcC]     Frame: [4][key?][u64 timestamp µs][access unit]
+
+let decoder = null, decoderConfig = null, wcWaitingForKey = true, decodedFrames = 0;
+
+function resetDecoder() {
+  if (decoder && decoder.state !== "closed") {
+    try { decoder.close(); } catch (_) {}
+  }
+  decoder = null;
+  wcWaitingForKey = true;
+}
+
+function onDecodedFrame(frame) {
+  // Draw immediately – this is what keeps the latency minimal
+  if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+    canvas.width = frame.displayWidth;
+    canvas.height = frame.displayHeight;
+  }
+  ctx.drawImage(frame, 0, 0);
+  frame.close();
+  stats.frames++;
+  decodedFrames++;
+  if (decodedFrames === 1) hideMessage();
+}
+
+function createDecoder(config) {
+  resetDecoder();
+  const instance = new VideoDecoder({
+    output: onDecodedFrame,
+    error: (e) => {
+      console.error("VideoDecoder:", e);
+      if (instance !== decoder) return;
+      // Start over with a fresh decoder at the next keyframe
+      setTimeout(() => { if (decoderConfig === config) { createDecoder(config); send("sync"); } }, 100);
+    },
+  });
+  instance.configure(config);
+  decoder = instance;
+  wcWaitingForKey = true;
+}
+
+async function onDecoderConfigPacket(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const length = bytes[1];
+  const config = {
+    codec: new TextDecoder().decode(bytes.subarray(2, 2 + length)),
+    description: bytes.slice(2 + length),
+    optimizeForLatency: true,
+    hardwareAcceleration: "prefer-hardware",
+  };
+  decoderConfig = config;
+  resetDecoder();
+  let supported = false;
+  try {
+    supported = (await VideoDecoder.isConfigSupported(config)).supported;
+    if (!supported) {
+      delete config.hardwareAcceleration;
+      supported = (await VideoDecoder.isConfigSupported(config)).supported;
+    }
+  } catch (_) {}
+  if (decoderConfig !== config) return;   // a newer configuration arrived meanwhile
+  if (!supported) {
+    showMessage(mode === "hevc"
+      ? "This browser cannot decode HEVC. Switch WebScreen to “Video auto” or “H.264”."
+      : "This browser cannot decode the video stream. Switch WebScreen to “JPEG”.");
+    return;
+  }
+  decodedFrames = 0;
+  createDecoder(config);
+  send("sync");   // frames that arrived while checking were dropped
+}
+
+function onRawVideoPacket(buffer) {
+  if (!decoder || decoder.state !== "configured") return;
+  const view = new DataView(buffer);
+  const isKey = view.getUint8(1) === 1;
+  if (wcWaitingForKey && !isKey) return;
+  if (decoder.decodeQueueSize > 2) {
+    // The decoder can't keep up → skip ahead to the next keyframe
+    stats.skipped++;
+    wcWaitingForKey = true;
+    send("sync");
+    if (!isKey) return;
+  }
+  wcWaitingForKey = false;
+  try {
+    decoder.decode(new EncodedVideoChunk({
+      type: isKey ? "key" : "delta",
+      timestamp: Number(view.getBigUint64(2)),
+      data: new Uint8Array(buffer, 10),
+    }));
+  } catch (e) {
+    console.error("decode:", e);
+    wcWaitingForKey = true;
+    send("sync");
+  }
+}
+
+// ───────────── Real-time via WebRTC (works on plain http://) ─────────────
+// The Mac sends an offer over the WebSocket, we answer; video then flows peer to peer
+// over UDP with a jitter buffer of a few milliseconds.
+
+const supportsWebRTC = typeof window.RTCPeerConnection === "function";
+let pc = null, rtcWatchdog = null, rtcStats = { fps: 0, delay: 0, mbps: 0, lastBytes: 0, lastTime: 0 };
+
+// After a failed attempt use the normal video mode for a while, then try real-time
+// again – a single hiccup must not lock a tab out of the fast mode for good.
+let rtcBlockedUntil = 0;
+function noRTC() {
+  return performance.now() < rtcBlockedUntil;
+}
 setInterval(() => {
-  if (!isVideoMode(mode) || !video.buffered.length) return;
+  // Block expired: reconnect once so the Mac can offer real-time again
+  if (rtcBlockedUntil && !noRTC() && ws && ws.readyState === WebSocket.OPEN) {
+    rtcBlockedUntil = 0;
+    ws.close();
+  }
+}, 5000);
+
+function resetRTC() {
+  clearTimeout(rtcWatchdog);
+  rtcWatchdog = null;
+  if (pc) {
+    try { pc.close(); } catch (_) {}
+    pc = null;
+    try { video.srcObject = null; } catch (_) {}
+  }
+}
+
+// WebRTC doesn't get through (e.g. UDP blocked) → reconnect using the normal video mode
+function rtcFallback(reason) {
+  console.warn("WebRTC fallback:", reason);
+  rtcBlockedUntil = performance.now() + 2 * 60 * 1000;
+  resetRTC();
+  if (ws) ws.close();
+}
+
+async function onRTCOffer(sdp) {
+  resetRTC();
+  const connection = new RTCPeerConnection({ iceServers: [], bundlePolicy: "max-bundle" });
+  pc = connection;
+  connection.onicecandidate = (e) => {
+    if (e.candidate && connection === pc) {
+      send("rtc:" + JSON.stringify({ type: "rtc-candidate", candidate: e.candidate.candidate,
+                                     sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex }));
+    }
+  };
+  connection.ontrack = (e) => {
+    // Play out as soon as a frame is decoded – no extra buffering
+    try { e.receiver.jitterBufferTarget = 0; } catch (_) {}
+    try { e.receiver.playoutDelayHint = 0; } catch (_) {}
+    video.srcObject = e.streams[0] || new MediaStream([e.track]);
+    video.play().catch(() => {});
+  };
+  connection.onconnectionstatechange = () => {
+    if (connection !== pc) return;
+    if (connection.connectionState === "failed") rtcFallback("connection failed");
+  };
+  clearTimeout(rtcWatchdog);
+  // Judge by what arrives, not by the video element: a tab in the background
+  // doesn't render, but its frames are still received.
+  rtcWatchdog = setTimeout(async () => {
+    if (connection !== pc) return;
+    let frames = 0;
+    try {
+      (await connection.getStats()).forEach((s) => {
+        if (s.type === "inbound-rtp" && s.kind === "video") frames = s.framesReceived || 0;
+      });
+    } catch (_) {}
+    if (connection === pc && frames === 0) rtcFallback("no picture after 8 s");
+  }, 8000);
+  try {
+    await connection.setRemoteDescription({ type: "offer", sdp });
+    const answer = await connection.createAnswer();
+    await connection.setLocalDescription(answer);
+    send("rtc:" + JSON.stringify({ type: "rtc-answer", sdp: connection.localDescription.sdp }));
+  } catch (e) {
+    rtcFallback(e);
+  }
+}
+
+function onRTCCandidate(msg) {
+  if (!pc || !msg.candidate) return;
+  pc.addIceCandidate({ candidate: msg.candidate, sdpMid: msg.sdpMid, sdpMLineIndex: msg.sdpMLineIndex })
+    .catch((e) => console.warn("addIceCandidate:", e));
+}
+
+video.addEventListener("playing", () => { if (mode === "webrtc") hideMessage(); });
+
+// Statistics for the overlay (frame rate, playout delay, data rate)
+setInterval(async () => {
+  if (!pc || mode !== "webrtc") return;
+  try {
+    const report = await pc.getStats();
+    report.forEach((s) => {
+      if (s.type !== "inbound-rtp" || s.kind !== "video") return;
+      const now = s.timestamp;
+      if (rtcStats.lastTime) rtcStats.mbps = ((s.bytesReceived - rtcStats.lastBytes) * 8) / ((now - rtcStats.lastTime) * 1000);
+      rtcStats.lastBytes = s.bytesReceived;
+      rtcStats.lastTime = now;
+      rtcStats.fps = s.framesPerSecond || 0;
+      rtcStats.delay = s.jitterBufferEmittedCount ? (s.jitterBufferDelay / s.jitterBufferEmittedCount) * 1000 : 0;
+      rtcStats.codec = s.codecId && report.get(s.codecId) ? report.get(s.codecId).mimeType.replace("video/", "") : "";
+    });
+    // Media bypasses the Mac's server in this mode – tell it what arrives here
+    send("stats:" + JSON.stringify({ fps: rtcStats.fps, mbps: Math.round(rtcStats.mbps * 100) / 100 }));
+  } catch (_) {}
+}, 1000);
+
+// MSE only: keep latency low by always playing close to the end of the buffer
+setInterval(() => {
+  if (useWebCodecs || !isVideoMode(mode) || !video.buffered.length) return;
   const end = video.buffered.end(video.buffered.length - 1);
   const lag = end - video.currentTime;
-  if (lag > 0.35) video.currentTime = end - 0.05;
-  else if (lag > 0.12) video.playbackRate = 1.15;
-  else video.playbackRate = 1.0;
+  // With a steady frame rate the buffer never runs dry on its own, so whatever piled up
+  // (e.g. at startup) would stay as latency – play slightly faster until ~2 frames remain
+  if (lag > 0.35) video.currentTime = end - 0.03;
+  else if (lag > 0.05) video.playbackRate = lag > 0.12 ? 1.15 : 1.05;
+  else if (lag < 0.03) video.playbackRate = 1.0;
   if (video.paused) video.play().catch(() => {});
   if (video.readyState >= 2) hideMessage();
 }, 200);
@@ -290,27 +528,124 @@ function deviceKey() {
   }
 }
 
-// Can this browser play HEVC via Media Source Extensions?
-function supportsHEVC() {
+// Several WebScreen tabs/windows in the same browser share localStorage, so each
+// one claims a "tab slot": slot 1 keeps the plain device key (existing devices stay
+// recognized), further tabs get their own key and thus their own screen. The slot is
+// kept in sessionStorage, so it survives reloading the tab; BroadcastChannel catches
+// slots that were copied by "Duplicate tab". (Web Locks would be simpler, but they
+// need a secure context, which plain http:// pages on the LAN are not.)
+let tabSlot = 1;
+const tabChannel = ("BroadcastChannel" in window) ? new BroadcastChannel("webscreen.tabs") : null;
+if (tabChannel) {
+  tabChannel.onmessage = (event) => {
+    if (event.data && event.data.q === "slots") tabChannel.postMessage({ slot: tabSlot, from: event.data.from });
+  };
+}
+
+async function claimTabSlot() {
+  if (!tabChannel) return;
+  const me = Math.random().toString(36).slice(2);
+  const taken = new Set();
+  const listener = (event) => {
+    if (event.data && event.data.from === me && event.data.slot) taken.add(event.data.slot);
+  };
+  tabSlot = 0;   // don't answer for a slot while looking for one
+  tabChannel.addEventListener("message", listener);
+  tabChannel.postMessage({ q: "slots", from: me });
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  tabChannel.removeEventListener("message", listener);
+  let stored = 0;
+  try { stored = parseInt(sessionStorage.getItem("webscreen.tab"), 10) || 0; } catch (_) {}
+  let slot = stored && !taken.has(stored) ? stored : 1;
+  while (taken.has(slot)) slot++;
+  tabSlot = slot;
+  try { sessionStorage.setItem("webscreen.tab", String(slot)); } catch (_) {}
+}
+
+function tabDeviceKey() {
+  const key = deviceKey();
+  return tabSlot > 1 && key ? `${key}-tab${tabSlot}` : key;
+}
+
+// Can this browser play HEVC (via WebCodecs or Media Source Extensions)?
+async function supportsHEVC() {
   try {
+    if (useWebCodecs) {
+      const result = await VideoDecoder.isConfigSupported({ codec: "hvc1.1.6.L120.90", optimizeForLatency: true });
+      return !!result.supported;
+    }
     return !!(MediaSourceImpl && MediaSourceImpl.isTypeSupported('video/mp4; codecs="hvc1.1.6.L120.90"'));
   } catch (_) {
     return false;
   }
 }
 
+// On the plain HTTP page: switch to the HTTPS address of the low-latency mode if
+// this device can reach it (DNS rebind protection on some routers prevents that).
+async function upgradeToSecurePage() {
+  if (isSecurePage || !SECURE_PORT || !SECURE_DOMAIN) return false;
+  if (new URLSearchParams(location.search).has("http")) return false;   // ?http forces the normal mode
+  const ipv4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(location.hostname) ? location.hostname : SECURE_HOST;
+  if (!ipv4) return false;
+  const origin = `https://${ipv4.replace(/\./g, "-")}.${SECURE_DOMAIN}:${SECURE_PORT}`;
+  showMessage("Checking low-latency mode …");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1500);
+  try {
+    await fetch(origin + "/ping", { mode: "no-cors", cache: "no-store", signal: controller.signal });
+    location.replace(origin + "/" + location.search);
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+let canPlayHEVC = false;
+let failedConnects = 0;
+
+// On the HTTPS page: if the Mac stays unreachable there (e.g. low-latency mode was
+// turned off), go back to the plain address.
+function fallBackToPlainPage() {
+  const match = location.hostname.match(/^(\d{1,3}(?:-\d{1,3}){3})\./);
+  if (!match) return false;
+  const params = new URLSearchParams(location.search);
+  params.set("http", "1");
+  location.replace(`http://${match[1].replace(/-/g, ".")}:${Number(WSS_PORT) - 3}/?${params}`);
+  return true;
+}
+
+let started = false;
+
 function connect() {
+  started = true;
   clearTimeout(reconnectTimer);
+  // Never keep two connections: an old socket would stay joined as a ghost device
+  if (ws) {
+    const old = ws;
+    ws = null;
+    old.onopen = old.onmessage = old.onclose = old.onerror = null;
+    try { old.close(); } catch (_) {}
+  }
+  lastMessage = performance.now();
   showMessage("Connecting to the Mac …");
-  const socket = new WebSocket(`ws://${location.hostname}:${WS_PORT}/`);
+  const url = isSecurePage
+    ? `wss://${location.hostname}:${WSS_PORT}/`
+    : `ws://${location.hostname}:${WS_PORT}/`;
+  const socket = new WebSocket(url);
   ws = socket;
   socket.binaryType = "arraybuffer";
   socket.onopen = () => {
     if (socket !== ws) return;
+    failedConnects = 0;
     showMessage("Connected – waiting for the image …");
     send("join:" + JSON.stringify({
-      device: deviceKey(),
-      hevc: supportsHEVC(),
+      device: tabDeviceKey(),
+      tab: tabSlot,
+      hevc: canPlayHEVC,
+      wc: useWebCodecs,
+      rtc: supportsWebRTC && !noRTC(),
       screen: wantedScreen(),
       width: Math.round(screen.width),
       height: Math.round(screen.height),
@@ -320,16 +655,27 @@ function connect() {
   };
   socket.onmessage = (event) => {
     if (socket !== ws) return;   // stragglers from an old connection
+    lastMessage = performance.now();
     if (typeof event.data === "string") {
       let msg;
       try { msg = JSON.parse(event.data); } catch (_) { return; }
-      if (msg.type === "hello") {
+      if (msg.type === "ping") {
+        return;
+      } else if (msg.type === "hello") {
         setMode(msg.mode);
         document.title = msg.name || "WebScreen";
+        // Show which screen this is – empty desktops all look alike
+        document.getElementById("screenName").textContent = msg.name || "";
+        if (typeof showToolbar === "function") showToolbar();
         showMessage("Connected to “" + (msg.name || "WebScreen") + "” …");
+      } else if (msg.type === "rtc-offer") {
+        onRTCOffer(msg.sdp);
+      } else if (msg.type === "rtc-candidate") {
+        onRTCCandidate(msg);
       } else if (msg.type === "waiting") {
         resetJpeg();
         resetVideo();
+        resetRTC();
         showMessage(msg.message || "Waiting for a screen …");
       }
       return;
@@ -340,6 +686,8 @@ function connect() {
       case 1: onJpegPacket(buffer); break;
       case 2: onInitPacket(buffer); break;
       case 3: onVideoPacket(buffer); break;
+      case 4: onRawVideoPacket(buffer); break;
+      case 5: onDecoderConfigPacket(buffer); break;
     }
   };
   socket.onclose = () => {
@@ -347,12 +695,58 @@ function connect() {
     ws = null;
     resetJpeg();
     resetVideo();
-    showMessage("No connection to the Mac – retrying …");
+    resetRTC();
+    showMessage("Searching for the Mac …");
+    failedConnects++;
+    if (isSecurePage && failedConnects >= 4 && fallBackToPlainPage()) return;
+    // Keep searching forever – quickly at first, then every 3 s
     clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connect, 1500);
+    reconnectTimer = setTimeout(connect, failedConnects < 5 ? 1000 : 3000);
   };
   socket.onerror = () => socket.close();
 }
+
+// Heartbeat: the Mac sends a ping every second. If nothing arrives for a while the
+// connection is dead (Wi-Fi gone, Mac asleep) even if the browser hasn't noticed yet.
+let lastMessage = performance.now();
+setInterval(() => {
+  if (!ws) return;
+  if (ws.readyState === WebSocket.OPEN) {
+    send("ping");
+    if (performance.now() - lastMessage > 6000) ws.close();
+  } else if (ws.readyState === WebSocket.CONNECTING && performance.now() - lastMessage > 8000) {
+    ws.close();   // a connect attempt that hangs
+  }
+}, 2000);
+
+// Coming back (tab shown again, device woke up, network back): reconnect right away
+function reconnectNow() {
+  if (!started) return;   // still starting up (checking HEVC, claiming the tab slot)
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  failedConnects = 0;
+  connect();
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) reconnectNow(); });
+window.addEventListener("online", reconnectNow);
+window.addEventListener("pageshow", (event) => { if (event.persisted) reconnectNow(); });
+
+// ───────────── Sharpness hint ─────────────
+// Text is only pixel-sharp when one image pixel lands on one display pixel. In a
+// window (not fullscreen) the picture is usually shrunk a little – say so.
+let lastScaleHint = "";
+setInterval(() => {
+  const el = (mode === "webrtc" || isVideoMode(mode)) ? video : canvas;
+  const w = el.videoWidth || el.width, h = el.videoHeight || el.height;
+  let hint = "";
+  if (w && h && innerWidth > 0 && innerHeight > 0) {
+    const dpr = window.devicePixelRatio || 1;
+    const scale = Math.min(innerWidth * dpr / w, innerHeight * dpr / h);
+    if (scale < 0.97) hint = `Shrunk to ${Math.round(scale * 100)} % – Fullscreen shows it sharp`;
+  }
+  document.getElementById("scaleHint").textContent = hint;
+  if (hint && hint !== lastScaleHint) showToolbar();
+  lastScaleHint = hint;
+}, 1000);
 
 // ───────────── Controls ─────────────
 
@@ -382,7 +776,15 @@ setInterval(() => {
   const now = performance.now();
   const secs = (now - stats.since) / 1000;
   let extra = "";
-  if (isVideoMode(mode) && video.buffered.length) {
+  if (mode === "webrtc") {
+    statsEl.textContent = `Real-time ${rtcStats.codec || ""}  ${rtcStats.fps.toFixed(0)} fps  ${rtcStats.mbps.toFixed(1)} Mbit/s\n` +
+      `playout delay: ${rtcStats.delay.toFixed(0)} ms`;
+    stats.frames = 0; stats.bytes = 0; stats.skipped = 0; stats.since = now;
+    return;
+  }
+  if (isVideoMode(mode) && useWebCodecs) {
+    extra = `  WebCodecs, queue: ${decoder ? decoder.decodeQueueSize : 0}`;
+  } else if (isVideoMode(mode) && video.buffered.length) {
     const lag = video.buffered.end(video.buffered.length - 1) - video.currentTime;
     extra = `  Buffer: ${(lag * 1000).toFixed(0)} ms`;
   }
@@ -392,7 +794,12 @@ setInterval(() => {
   stats.frames = 0; stats.bytes = 0; stats.skipped = 0; stats.since = now;
 }, 1000);
 
-connect();
+(async () => {
+  if (await upgradeToSecurePage()) return;
+  canPlayHEVC = await supportsHEVC();
+  await claimTabSlot();
+  connect();
+})();
 </script>
 </body>
 </html>

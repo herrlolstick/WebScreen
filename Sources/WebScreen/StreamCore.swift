@@ -4,11 +4,12 @@ import Foundation
 
 /// Streaming method (setting)
 enum StreamMode: String, CaseIterable, Identifiable {
-    case jpeg, h264, hevc, videoAuto
+    case realtime, jpeg, h264, hevc, videoAuto
     var id: String { rawValue }
 
     var title: String {
         switch self {
+        case .realtime: return "Real-time"
         case .jpeg: return "JPEG"
         case .h264: return "H.264"
         case .hevc: return "HEVC"
@@ -21,10 +22,11 @@ enum StreamMode: String, CaseIterable, Identifiable {
 
 /// Method actually used by a screen
 enum StreamCodec: String, Equatable {
-    case jpeg, h264, hevc
+    case webrtc, jpeg, h264, hevc
 
     var title: String {
         switch self {
+        case .webrtc: return "Real-time"
         case .jpeg: return "JPEG"
         case .h264: return "H.264"
         case .hevc: return "HEVC"
@@ -35,7 +37,7 @@ enum StreamCodec: String, Equatable {
     var maxDimension: Int {
         switch self {
         case .jpeg: return 16_384
-        case .h264: return 4096
+        case .webrtc, .h264: return 4096
         case .hevc: return 8192
         }
     }
@@ -43,9 +45,10 @@ enum StreamCodec: String, Equatable {
 
 /// Common interface of both encoding pipelines
 protocol FramePipelineProtocol: AnyObject {
-    /// Finished packet for all receivers. `isSync` = full frame or keyframe
-    /// where a receiver can (re)join the stream.
-    var onPacket: ((Data, Bool) -> Void)? { get set }
+    /// Finished packet for all receivers. The optional second packet is the same
+    /// content for WebCodecs receivers (raw access unit instead of fMP4).
+    /// `isSync` = full frame or keyframe where a receiver can (re)join the stream.
+    var onPacket: ((Data, Data?, Bool) -> Void)? { get set }
     var hasReceivers: () -> Bool { get set }
     func submit(_ pixelBuffer: CVPixelBuffer, pts: CMTime)
     /// Make the next packet an entry point (even if nothing is moving)

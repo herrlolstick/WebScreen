@@ -15,7 +15,7 @@ import ImageIO
 /// Partial updates are always computed against the last *sent* image,
 /// so this stays correct when frames are skipped.
 final class JPEGPipeline: FramePipelineProtocol {
-    var onPacket: ((Data, Bool) -> Void)?
+    var onPacket: ((Data, Data?, Bool) -> Void)?
     var hasReceivers: () -> Bool = { true }
 
     private let queue = DispatchQueue(label: "webscreen.encode", qos: .userInteractive)
@@ -93,7 +93,7 @@ final class JPEGPipeline: FramePipelineProtocol {
                 continue
             }
             if let result = encode(pixelBuffer, forceFull: full) {
-                onPacket?(result.packet, result.isFull)
+                onPacket?(result.packet, nil, result.isFull)
             }
         }
     }
