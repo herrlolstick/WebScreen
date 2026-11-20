@@ -499,6 +499,54 @@ final class AppModel: ObservableObject {
         server?.disconnect(client.id)
     }
 
+    // MARK: Removing from the sidebar
+
+    /// A device is watching this screen right now
+    func isConnected(_ screen: ScreenSession) -> Bool {
+        clients.contains { $0.screenID == screen.id }
+    }
+
+    /// Whether the sidebar may offer to remove this screen: nobody is watching it,
+    /// and the last regular screen always stays.
+    func canRemove(_ screen: ScreenSession) -> Bool {
+        guard !isConnected(screen) else { return false }
+        return screen.config.isDeviceScreen || fixedScreens.count > 1
+    }
+
+    /// Device screen → forget its device (and with it the screen); regular screen → delete it
+    func removeOrForget(_ screen: ScreenSession) async {
+        guard canRemove(screen) else { return }
+        if let ownerID = screen.config.ownerDeviceID,
+           let device = devices.first(where: { $0.id == ownerID }) {
+            await forget(device)
+        } else {
+            await removeScreen(screen)
+        }
+    }
+
+    /// No browser of this computer/tablet is connected
+    func canForget(_ group: DeviceGroup) -> Bool {
+        !group.screens.contains { isConnected($0) }
+            && !clients.contains { client in devicesIn(group).contains { $0.id == client.deviceKey } }
+    }
+
+    /// Forget a whole computer/tablet: every browser (and tab) that belongs to it
+    func forget(_ group: DeviceGroup) async {
+        guard canForget(group) else { return }
+        for device in devicesIn(group) {
+            await forget(device)
+        }
+        // Screens whose device record is already gone
+        for screen in group.screens where screens.contains(where: { $0.id == screen.id }) {
+            await removeScreen(screen)
+        }
+    }
+
+    private func devicesIn(_ group: DeviceGroup) -> [KnownDevice] {
+        let owners = Set(group.screens.compactMap(\.config.ownerDeviceID))
+        return devices.filter { owners.contains($0.id) || $0.lastAddress == group.id }
+    }
+
     /// Describes where a device without a manual assignment would end up
     func automaticTargetName(for device: KnownDevice) -> String {
         switch assignmentMode {

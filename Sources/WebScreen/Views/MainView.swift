@@ -51,7 +51,7 @@ struct MainView: View {
                                     .tag(Page.screen(screen.id))
                             }
                         } header: {
-                            Label(group.title, systemImage: group.symbol)
+                            DeviceGroupHeader(group: group)
                         }
                     }
                     if model.deviceScreens.isEmpty {
@@ -150,8 +150,10 @@ private struct ScreenSidebarRow: View {
     @EnvironmentObject private var model: AppModel
     @ObservedObject var screen: ScreenSession
     var title: String? = nil
+    @State private var hovering = false
 
     var body: some View {
+        let removable = model.canRemove(screen)
         Label {
             HStack(spacing: 6) {
                 Text(title ?? screen.config.name).lineLimit(1)
@@ -161,12 +163,58 @@ private struct ScreenSidebarRow: View {
                         .foregroundStyle(.yellow)
                         .help("Main screen")
                 }
+                Spacer(minLength: 4)
+                if hovering && removable {
+                    SidebarRemoveButton(help: screen.config.isDeviceScreen ? "Forget this device" : "Remove this screen") {
+                        Task { await model.removeOrForget(screen) }
+                    }
+                }
             }
         } icon: {
             Image(systemName: screen.config.isDeviceScreen ? "ipad.landscape" : "display")
                 .foregroundStyle(screen.isRunning ? Color.green : Color.secondary)
         }
         .badge(model.clients(on: screen).count)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+    }
+}
+
+/// Section header of a computer/tablet; offers to forget it while none of its browsers is connected
+private struct DeviceGroupHeader: View {
+    @EnvironmentObject private var model: AppModel
+    let group: DeviceGroup
+    @State private var hovering = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Label(group.title, systemImage: group.symbol)
+            Spacer(minLength: 4)
+            if hovering && model.canForget(group) {
+                SidebarRemoveButton(help: "Forget \(group.title) and all its browsers") {
+                    Task { await model.forget(group) }
+                }
+            }
+        }
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+    }
+}
+
+/// Small × shown on hover in the sidebar
+private struct SidebarRemoveButton: View {
+    let help: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "xmark.circle.fill")
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.borderless)
+        .help(help)
+        .accessibilityLabel(help)
     }
 }
 
